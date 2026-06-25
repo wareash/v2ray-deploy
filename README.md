@@ -12,6 +12,21 @@
 - 自动生成 **UUID** 与**随机 WebSocket 路径**
 - 自动输出 `vmess://` 链接与终端二维码，可直接导入 v2rayN / v2rayNG / Shadowrocket 等客户端
 - 使用现代 **VMess AEAD（alterId = 0）** 加密
+- **BBR 加速**：一键开启 BBR + fq 队列，提升网络吞吐
+- **多用户管理**：随时添加 / 删除用户，每个用户独立 UUID 与连接链接
+- **一键卸载**：清理 V2Ray、Nginx 站点配置、续期任务（证书/伪装站可选择是否删除）
+
+## 命令一览
+
+```bash
+sudo bash deploy.sh             # 交互菜单
+sudo bash deploy.sh install     # 部署
+sudo bash deploy.sh adduser     # 添加用户（也可 adduser alice 直接指定备注）
+sudo bash deploy.sh deluser     # 删除用户（按序号）
+sudo bash deploy.sh users       # 查看所有用户及各自 vmess 链接/二维码
+sudo bash deploy.sh bbr         # 开启 BBR 加速
+sudo bash deploy.sh uninstall   # 卸载
+```
 
 ## 适用系统
 
@@ -52,16 +67,17 @@ sudo bash deploy.sh
 | `/etc/nginx/conf.d/v2ray.conf` | Nginx 站点与反代配置 |
 | `/data/v2ray.crt` `/data/v2ray.key` | TLS 证书与私钥 |
 | `/home/wwwroot/blog` | 伪装站点根目录 |
-| `/usr/local/vmess_qr.json` | 客户端配置（用于生成链接/二维码） |
+| `/usr/local/etc/v2ray-deploy/deploy.conf` | 部署元数据（域名 / 路径 / 端口，供用户管理使用） |
 | `/usr/bin/ssl_update.sh` | 证书续期脚本（cron 每周执行） |
+| `/etc/sysctl.d/99-bbr.conf` | BBR 加速配置 |
 
-## 卸载 / 回滚
+## 卸载
 
 ```bash
-systemctl stop v2ray nginx
-# 删除配置后按需重装或恢复
-rm -f /etc/nginx/conf.d/v2ray.conf
+sudo bash deploy.sh uninstall
 ```
+
+会停止并移除 V2Ray、删除 Nginx 站点配置与证书续期任务；证书目录与伪装站目录会询问是否一并删除。Nginx 软件包与 BBR 设置默认保留。
 
 ## 免责声明
 
