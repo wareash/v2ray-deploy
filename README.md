@@ -39,7 +39,7 @@ sudo bash deploy.sh uninstall   # 卸载
 
 ```bash
 # 下载脚本
-curl -fsSLO https://raw.githubusercontent.com/<你的用户名>/v2ray-deploy/main/deploy.sh
+curl -fsSLO https://raw.githubusercontent.com/wareash/v2ray-deploy/main/deploy.sh
 
 # 运行（交互式）
 sudo bash deploy.sh
