@@ -34,7 +34,8 @@ CERT_DIR="/data"
 CERT_FILE="${CERT_DIR}/v2ray.crt"
 KEY_FILE="${CERT_DIR}/v2ray.key"
 WEBROOT="/home/wwwroot/blog"
-V2RAY_CONFIG="/etc/v2ray/config.json"
+# 官方 v2fly 安装脚本默认配置路径；实际路径会通过 detect_v2ray_config_path() 从 systemd 探测
+V2RAY_CONFIG="/usr/local/etc/v2ray/config.json"
 NGINX_CONF="/etc/nginx/conf.d/v2ray.conf"
 META_DIR="/usr/local/etc/v2ray-deploy"
 META_FILE="${META_DIR}/deploy.conf"
@@ -82,6 +83,7 @@ load_meta() {
 }
 
 require_installed() {
+    detect_v2ray_config_path
     if [[ ! -f "$V2RAY_CONFIG" ]]; then
         error "未检测到已部署的 V2Ray，请先执行：sudo bash deploy.sh install"
         exit 1
@@ -94,7 +96,7 @@ install_deps() {
     info "更新软件源并安装依赖 ..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y curl socat unzip git nginx dnsutils qrencode jq ca-certificates >/dev/null
+    apt-get install -y curl socat unzip git nginx dnsutils qrencode jq iproute2 ca-certificates >/dev/null
     info "依赖安装完成。"
 }
 
@@ -164,6 +166,25 @@ install_v2ray() {
     info "安装 V2Ray（官方 v2fly 脚本）..."
     bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) >/dev/null
     info "V2Ray 安装完成。"
+}
+
+# 关键：V2Ray 实际读取的配置路径由 systemd 服务的 ExecStart 决定（官方脚本用
+# /usr/local/etc/v2ray/config.json，部分定制安装用 /etc/v2ray/config.json）。
+# 必须从服务定义动态探测，否则会出现“配置写对地方、服务读空配置”导致不监听端口的问题。
+detect_v2ray_config_path() {
+    local line cfg
+    line=$(systemctl cat v2ray 2>/dev/null | grep -m1 '^ExecStart=')
+    [[ -z "$line" && -f /etc/systemd/system/v2ray.service ]] && line=$(grep -m1 '^ExecStart=' /etc/systemd/system/v2ray.service)
+    [[ -z "$line" ]] && return 0
+    cfg=$(awk '{for(i=1;i<=NF;i++){
+        if($i=="-c"||$i=="-config"){print $(i+1);exit}
+        if($i ~ /^-config=/){s=$i;sub(/^-config=/,"",s);print s;exit}
+        if($i ~ /^-c=/){s=$i;sub(/^-c=/,"",s);print s;exit}
+    }}' <<<"$line")
+    if [[ -n "$cfg" && "$cfg" == *.json ]]; then
+        V2RAY_CONFIG="$cfg"
+        info "检测到 V2Ray 实际配置路径：${V2RAY_CONFIG}"
+    fi
 }
 
 gen_identifiers() {
@@ -362,11 +383,32 @@ start_services() {
     nginx -t >/dev/null
     systemctl enable v2ray >/dev/null 2>&1 || true; systemctl restart v2ray
     systemctl enable nginx >/dev/null 2>&1 || true; systemctl restart nginx
+    verify_listening
+}
+
+# 启动后健康检查：确认 V2Ray 真的监听了端口（避免“服务 active 却没监听”导致的 502）
+verify_listening() {
+    sleep 2
+    local ok=""
+    for _ in 1 2 3 4 5; do
+        if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${V2RAY_PORT}\b"; then ok=1; break; fi
+        sleep 1
+    done
+    if [[ -n "$ok" ]]; then
+        info "健康检查通过：V2Ray 正在监听 127.0.0.1:${V2RAY_PORT}。"
+    else
+        error "健康检查失败：V2Ray 未监听 127.0.0.1:${V2RAY_PORT}！"
+        error "服务实际读取的配置：$(systemctl cat v2ray 2>/dev/null | grep -m1 '^ExecStart=')"
+        error "本脚本写入的配置：${V2RAY_CONFIG}"
+        warn  "请检查二者是否一致，以及 V2Ray 日志：journalctl -u v2ray -n 30 --no-pager"
+        exit 1
+    fi
 }
 
 restart_v2ray() {
     /usr/local/bin/v2ray test -c "$V2RAY_CONFIG" >/dev/null
     systemctl restart v2ray
+    verify_listening
 }
 
 # ====================== 子命令 ======================
@@ -376,6 +418,7 @@ do_install() {
     install_deps
     input_and_verify_domain
     install_v2ray
+    detect_v2ray_config_path
     gen_identifiers
     issue_cert
     deploy_camouflage
