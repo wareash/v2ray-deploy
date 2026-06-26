@@ -15,7 +15,9 @@
 #   sudo bash deploy.sh bbr            # 开启 BBR 加速
 #   sudo bash deploy.sh uninstall      # 卸载
 
-set -euo pipefail
+# 注意：刻意不使用 pipefail。配合 set -e 时，`cmd | grep -m1`/`| head` 会因下游提前
+# 关闭管道使上游收到 SIGPIPE(退出码141)，被 pipefail+set -e 误判为致命错误。
+set -eu
 
 # ---------- 终端颜色 ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;36m'; PLAIN='\033[0m'
@@ -110,12 +112,16 @@ get_public_ip() {
     return 1
 }
 resolve_domain() {
-    local domain="$1" ip=""
+    local domain="$1" ip="" out=""
     if command -v dig >/dev/null 2>&1; then
-        ip=$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-        [[ -z "$ip" ]] && ip=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+        out=$(dig +short A "$domain" @1.1.1.1 2>/dev/null || true)
+        [[ -z "$out" ]] && out=$(dig +short A "$domain" 2>/dev/null || true)
+        ip=$(grep -E '^[0-9.]+$' <<<"$out" | head -1 || true)
     fi
-    [[ -z "$ip" ]] && command -v getent >/dev/null 2>&1 && ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+    if [[ -z "$ip" ]] && command -v getent >/dev/null 2>&1; then
+        out=$(getent ahostsv4 "$domain" 2>/dev/null || true)
+        ip=$(awk '{print $1}' <<<"$out" | head -1 || true)
+    fi
     echo "$ip"
 }
 
@@ -172,9 +178,11 @@ install_v2ray() {
 # /usr/local/etc/v2ray/config.json，部分定制安装用 /etc/v2ray/config.json）。
 # 必须从服务定义动态探测，否则会出现“配置写对地方、服务读空配置”导致不监听端口的问题。
 detect_v2ray_config_path() {
-    local line cfg
-    line=$(systemctl cat v2ray 2>/dev/null | grep -m1 '^ExecStart=')
-    [[ -z "$line" && -f /etc/systemd/system/v2ray.service ]] && line=$(grep -m1 '^ExecStart=' /etc/systemd/system/v2ray.service)
+    local unit line cfg
+    # 先把整段输出读入变量，再在变量上 grep，避免 grep -m1 触发上游 SIGPIPE
+    unit=$(systemctl cat v2ray 2>/dev/null || true)
+    [[ -z "$unit" && -f /etc/systemd/system/v2ray.service ]] && unit=$(cat /etc/systemd/system/v2ray.service 2>/dev/null || true)
+    line=$(grep -m1 '^ExecStart=' <<<"$unit" || true)
     [[ -z "$line" ]] && return 0
     cfg=$(awk '{for(i=1;i<=NF;i++){
         if($i=="-c"||$i=="-config"){print $(i+1);exit}
@@ -206,13 +214,23 @@ issue_cert() {
     "${ACME_HOME}/acme.sh" --register-account -m "$EMAIL" >/dev/null 2>&1 || true
     info "通过 standalone 模式签发证书（临时占用 80 端口）..."
     systemctl stop nginx >/dev/null 2>&1 || true
-    if ! "${ACME_HOME}/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 >/dev/null 2>&1; then
-        error "证书签发失败。请确认 80 端口空闲、域名已解析、防火墙放行 80/443。"
+    # acme.sh --issue 退出码：0=成功签发，2=证书已存在且无需续期（跳过）。两者都视为正常；
+    # 其它非零码才是真正失败。这样重复运行 install 时不会因"已有证书"被误判为失败。
+    local rc=0
+    "${ACME_HOME}/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 >/dev/null 2>&1 || rc=$?
+    if [[ $rc -ne 0 && $rc -ne 2 ]]; then
+        error "证书签发失败（acme.sh 退出码 ${rc}）。请确认 80 端口空闲、域名已解析、防火墙放行 80/443。"
         systemctl start nginx >/dev/null 2>&1 || true; exit 1
     fi
+    # 安装/复制证书到目标路径
     "${ACME_HOME}/acme.sh" --install-cert -d "$DOMAIN" --ecc \
-        --fullchain-file "$CERT_FILE" --key-file "$KEY_FILE" >/dev/null
-    info "证书签发完成。"
+        --fullchain-file "$CERT_FILE" --key-file "$KEY_FILE" >/dev/null 2>&1 || true
+    # 以"证书文件是否真正生成"作为最终成功判据，避免退出码歧义
+    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
+        error "证书文件未生成（${CERT_FILE} / ${KEY_FILE}）。请检查 acme.sh 日志：${ACME_HOME}/acme.sh --info -d ${DOMAIN}"
+        systemctl start nginx >/dev/null 2>&1 || true; exit 1
+    fi
+    info "证书就绪：${CERT_FILE}"
 }
 
 # ---------- 伪装站 ----------
@@ -264,6 +282,8 @@ write_v2ray_config() {
   "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["vmess-in"], "outboundTag": "direct" } ] }
 }
 EOF
+    # 官方 v2ray 服务以 User=nobody 运行，必须保证配置文件对其可读
+    chmod 644 "$V2RAY_CONFIG"
 }
 
 # ---------- 写 Nginx 配置 ----------
@@ -389,9 +409,11 @@ start_services() {
 # 启动后健康检查：确认 V2Ray 真的监听了端口（避免“服务 active 却没监听”导致的 502）
 verify_listening() {
     sleep 2
-    local ok=""
+    local ok="" listening
     for _ in 1 2 3 4 5; do
-        if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${V2RAY_PORT}\b"; then ok=1; break; fi
+        # 先存变量再匹配，避免 grep 提前关闭管道导致 ss 收到 SIGPIPE 而误判
+        listening=$(ss -tlnp 2>/dev/null || true)
+        if grep -q "127.0.0.1:${V2RAY_PORT}\b" <<<"$listening"; then ok=1; break; fi
         sleep 1
     done
     if [[ -n "$ok" ]]; then
@@ -452,6 +474,7 @@ do_adduser() {
     jq --arg id "$uuid" --arg n "$name" \
         '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$n}]' \
         "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已添加用户：${name}"
     print_user_link "$uuid" "$name"
@@ -472,6 +495,7 @@ do_deluser() {
     local name; name=$(echo "${users[$jq_idx]}" | cut -f1)
     local tmp; tmp=$(mktemp)
     jq "del(.inbounds[0].settings.clients[$jq_idx])" "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已删除用户：${name}"
 }
