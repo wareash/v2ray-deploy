@@ -30,6 +30,19 @@ sudo bash deploy.sh upgrade     # 升级：网络优化(BBR+大缓冲+MTU探测)
 sudo bash deploy.sh uninstall   # 卸载
 ```
 
+> 管理类命令（`users`/`adduser`/`deluser`）会自动识别现有部署的协议（**VMess / VLESS**）并从 `nginx -T` 探测域名，因此也能管理非本脚本/手动部署的节点。
+
+## 客户端导入与信息保存
+
+- `install` / `adduser` / `users` 运行结束会额外输出 **Anywhere**（iOS/iPadOS/macOS 原生客户端）一键导入链接：
+
+```
+anywhere://add-proxy?link=<分享链接>
+```
+
+- 同时把全部连接信息（分享链接 + Anywhere 链接）保存到**运行目录**下的 `v2ray-<域名>-info.txt`。
+- 注意：Anywhere **不支持 vmess**，一键导入仅对 `vless` 等协议有效；vmess 节点请用分享链接/二维码导入支持 vmess 的客户端。
+
 ## 适用系统
 
 - Debian 10+ / Ubuntu 20.04+

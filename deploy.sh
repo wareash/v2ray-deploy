@@ -15,6 +15,10 @@
 #   sudo bash deploy.sh bbr            # 开启 BBR 加速
 #   sudo bash deploy.sh upgrade        # 升级：网络优化 + 动态伪装站（兼容旧部署）
 #   sudo bash deploy.sh uninstall      # 卸载
+#
+# 说明：install / adduser / users 运行结束会生成 Anywhere(iOS/macOS 客户端) 一键导入
+#       链接（anywhere://add-proxy?link=...），并把连接信息保存到“运行目录”下的
+#       v2ray-<域名>-info.txt 文件中。注意 Anywhere 不支持 vmess，仅 vless 等可一键导入。
 
 # 注意：刻意不使用 pipefail。配合 set -e 时，`cmd | grep -m1`/`| head` 会因下游提前
 # 关闭管道使上游收到 SIGPIPE(退出码141)，被 pipefail+set -e 误判为致命错误。
@@ -34,6 +38,8 @@ V2RAY_PORT=36649
 WS_PATH=""
 UUID=""
 PROTOCOL="vmess"   # 本脚本部署为 vmess；管理旧/手动部署时会从配置自动探测（可能是 vless）
+RUN_DIR="$(pwd)"   # 脚本被调用时的工作目录；运行结束把连接信息保存到这里
+INFO_FILE=""       # 运行目录下保存连接信息的文件（init_info_file 时确定）
 CERT_DIR="/data"
 CERT_FILE="${CERT_DIR}/v2ray.crt"
 KEY_FILE="${CERT_DIR}/v2ray.key"
@@ -603,19 +609,58 @@ build_link() {
     if [[ "${PROTOCOL,,}" == "vless" ]]; then build_vless_link "$1" "$2"; else build_vmess_link "$1" "$2"; fi
 }
 
+# Anywhere(iOS/macOS 原生客户端) 一键导入 deep link：anywhere://add-proxy?link=<链接>
+# link 参数取 ?link= 之后的内容（无需百分号编码）。注意 Anywhere 不支持 vmess://。
+build_anywhere_link() { echo "anywhere://add-proxy?link=$1"; }
+
+# 初始化运行目录下的连接信息文件
+init_info_file() {
+    INFO_FILE="${RUN_DIR}/v2ray-${DOMAIN}-info.txt"
+    {
+        echo "# V2Ray 连接信息"
+        echo "# 生成时间：$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# 伪装网站：https://${DOMAIN}/"
+        echo "# 协议：${PROTOCOL}    地址：${DOMAIN}    端口：443    路径：${WS_PATH}"
+        echo "# Anywhere 客户端：https://apps.apple.com/us/app/id6758235178"
+        echo
+    } > "$INFO_FILE" 2>/dev/null || { warn "无法写入运行目录 ${RUN_DIR}，跳过信息保存。"; INFO_FILE=""; }
+}
+
+# 追加一条用户记录到信息文件
+append_info() {  # <uuid> <name> <link> <anywhere_link>
+    [[ -n "$INFO_FILE" ]] || return 0
+    {
+        echo "用户：$2"
+        echo "UUID：$1"
+        echo "链接：$3"
+        echo "Anywhere 一键导入：$4"
+        echo "----------------------------------------"
+    } >> "$INFO_FILE" 2>/dev/null || true
+}
+
 print_user_link() {
     local uuid="$1" name="$2"
     local ps="${name}_${DOMAIN}"
     local link; link=$(build_link "$uuid" "$ps")
+    local aw; aw=$(build_anywhere_link "$link")
     local scheme="vmess"; [[ "${PROTOCOL,,}" == "vless" ]] && scheme="vless"
     echo
     echo -e "${GREEN}用户：${name}${PLAIN}  UUID：${uuid}"
     echo -e "${BLUE}${scheme}:// 链接：${PLAIN}"
     echo "$link"
+    echo -e "${BLUE}Anywhere 一键导入：${PLAIN}"
+    echo "$aw"
+    [[ "${PROTOCOL,,}" == "vmess" ]] && warn "Anywhere 不支持 vmess，该一键导入仅对 vless 等协议有效。"
     if command -v qrencode >/dev/null 2>&1; then
-        echo -e "${BLUE}二维码：${PLAIN}"
+        echo -e "${BLUE}二维码（${scheme} 链接）：${PLAIN}"
         qrencode -t ANSIUTF8 "$link"
     fi
+    append_info "$uuid" "$name" "$link" "$aw"
+}
+
+# 提示信息文件已保存
+notify_info_saved() {
+    [[ -n "$INFO_FILE" && -f "$INFO_FILE" ]] && info "连接信息已保存到：${GREEN}${INFO_FILE}${PLAIN}"
 }
 
 # ---------- 启动 ----------
@@ -683,7 +728,9 @@ do_install() {
     echo -e " 路径(path): ${WS_PATH}"
     echo -e "${GREEN}===============================================${PLAIN}"
     # 链接与二维码放在最后输出，方便直接复制 / 扫码
+    init_info_file
     print_user_link "$UUID" "admin"
+    notify_info_saved
 }
 
 # 添加用户：adduser [备注]
@@ -709,7 +756,9 @@ do_adduser() {
     chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已添加用户：${name}"
+    init_info_file
     print_user_link "$uuid" "$name"
+    notify_info_saved
 }
 
 # 删除用户
@@ -737,12 +786,14 @@ do_users() {
     check_root; require_installed; need_jq
     local count; count=$(jq '.inbounds[0].settings.clients | length' "$V2RAY_CONFIG")
     info "共 ${count} 个用户（域名：${DOMAIN}，路径：${WS_PATH}）："
+    init_info_file
     local n
     while IFS=$'\t' read -r name id; do
         [[ -z "$id" ]] && continue
         n=${name:-user}
         print_user_link "$id" "$n"
     done < <(jq -r '.inbounds[0].settings.clients[] | "\(.email // "user")\t\(.id)"' "$V2RAY_CONFIG")
+    notify_info_saved
 }
 
 do_bbr() { check_root; enable_bbr; }
@@ -896,7 +947,7 @@ main() {
         uninstall)      do_uninstall ;;
         menu|"")        menu ;;
         -h|--help|help) sed -n '2,21p' "$0" ;;
-        *) error "未知命令：$cmd"; sed -n '12,21p' "$0"; exit 1 ;;
+        *) error "未知命令：$cmd"; sed -n '10,21p' "$0"; exit 1 ;;
     esac
 }
 
