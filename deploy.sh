@@ -33,6 +33,7 @@ EMAIL=""
 V2RAY_PORT=36649
 WS_PATH=""
 UUID=""
+PROTOCOL="vmess"   # 本脚本部署为 vmess；管理旧/手动部署时会从配置自动探测（可能是 vless）
 CERT_DIR="/data"
 CERT_FILE="${CERT_DIR}/v2ray.crt"
 KEY_FILE="${CERT_DIR}/v2ray.key"
@@ -63,7 +64,24 @@ DOMAIN="${DOMAIN}"
 WS_PATH="${WS_PATH}"
 V2RAY_PORT="${V2RAY_PORT}"
 WEBROOT="${WEBROOT}"
+PROTOCOL="${PROTOCOL}"
 EOF
+}
+
+# 从 nginx 配置探测对外服务域名（排除占位/本地名）
+detect_domain() {
+    local dump names n
+    dump=$(nginx -T 2>/dev/null || true)
+    [[ -z "$dump" ]] && dump=$(grep -rhE '^[[:space:]]*server_name' /etc/nginx/ 2>/dev/null || true)
+    names=$(grep -E '^[[:space:]]*server_name' <<<"$dump" | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;.*$//' | tr ' ' '\n' || true)
+    while read -r n; do
+        [[ -z "$n" ]] && continue
+        case "$n" in
+            _|localhost|*[!a-zA-Z0-9.-]*) continue ;;
+        esac
+        [[ "$n" == *.* ]] || continue
+        echo "$n"; return 0
+    done <<<"$names"
 }
 
 # 读取元数据；若元数据缺失（如旧脚本部署），尝试从现有配置回退推断
@@ -77,9 +95,12 @@ load_meta() {
     need_jq
     WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path // empty' "$V2RAY_CONFIG" 2>/dev/null)
     V2RAY_PORT=$(jq -r '.inbounds[0].port // 36649' "$V2RAY_CONFIG" 2>/dev/null)
+    PROTOCOL=$(jq -r '.inbounds[0].protocol // "vmess"' "$V2RAY_CONFIG" 2>/dev/null)
+    # 域名：优先脚本自身的 NGINX_CONF，其次从全局 nginx 配置探测（兼容手动/旧部署）
     if [[ -f "$NGINX_CONF" ]]; then
         DOMAIN=$(grep -m1 -E '^\s*server_name' "$NGINX_CONF" | awk '{print $2}' | tr -d ';')
     fi
+    [[ -z "$DOMAIN" ]] && DOMAIN=$(detect_domain)
     [[ -n "$DOMAIN" && -n "$WS_PATH" ]] || return 1
     save_meta
     return 0
@@ -546,6 +567,19 @@ EOF
 }
 
 # ---------- 生成客户端链接 ----------
+# URL 编码（用于 vless 链接的 path 等参数）
+urlencode() {
+    local s="$1" out="" c i
+    for ((i=0;i<${#s};i++)); do
+        c="${s:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+    done
+    echo "$out"
+}
+
 # 用法：build_vmess_link <uuid> <ps备注>
 build_vmess_link() {
     local uuid="$1" ps="$2"
@@ -557,13 +591,26 @@ EOF
     echo "vmess://$(echo -n "$json" | base64 -w0)"
 }
 
+# 用法：build_vless_link <uuid> <ps备注>（VLESS + WS + TLS，TLS 由 nginx 在 443 终止）
+build_vless_link() {
+    local uuid="$1" ps="$2"
+    local p; p=$(urlencode "$WS_PATH")
+    echo "vless://${uuid}@${DOMAIN}:443?encryption=none&security=tls&type=ws&host=${DOMAIN}&sni=${DOMAIN}&path=${p}#$(urlencode "$ps")"
+}
+
+# 按当前部署协议生成链接
+build_link() {
+    if [[ "${PROTOCOL,,}" == "vless" ]]; then build_vless_link "$1" "$2"; else build_vmess_link "$1" "$2"; fi
+}
+
 print_user_link() {
     local uuid="$1" name="$2"
     local ps="${name}_${DOMAIN}"
-    local link; link=$(build_vmess_link "$uuid" "$ps")
+    local link; link=$(build_link "$uuid" "$ps")
+    local scheme="vmess"; [[ "${PROTOCOL,,}" == "vless" ]] && scheme="vless"
     echo
     echo -e "${GREEN}用户：${name}${PLAIN}  UUID：${uuid}"
-    echo -e "${BLUE}vmess:// 链接：${PLAIN}"
+    echo -e "${BLUE}${scheme}:// 链接：${PLAIN}"
     echo "$link"
     if command -v qrencode >/dev/null 2>&1; then
         echo -e "${BLUE}二维码：${PLAIN}"
@@ -650,9 +697,15 @@ do_adduser() {
     fi
     local uuid; uuid=$(gen_uuid)
     local tmp; tmp=$(mktemp)
-    jq --arg id "$uuid" --arg n "$name" \
-        '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$n}]' \
-        "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    if [[ "${PROTOCOL,,}" == "vless" ]]; then
+        jq --arg id "$uuid" --arg n "$name" \
+            '.inbounds[0].settings.clients += [{"id":$id,"email":$n}]' \
+            "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    else
+        jq --arg id "$uuid" --arg n "$name" \
+            '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$n}]' \
+            "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    fi
     chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已添加用户：${name}"
