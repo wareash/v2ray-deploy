@@ -15,6 +15,7 @@
 - **BBR 加速**：一键开启 BBR + fq 队列，提升网络吞吐
 - **多用户管理**：随时添加 / 删除用户，每个用户独立 UUID 与连接链接
 - **一键卸载**：清理 V2Ray、Nginx 站点配置、续期任务（证书/伪装站可选择是否删除）
+- **动态伪装站**：每日定时抓取[量子位(qbitai.com)](https://www.qbitai.com/)的真实 AI 资讯生成首页，看起来是一个持续更新的资讯站，而非静态假页面（抓取器 `/usr/local/bin/qbit-camouflage`，每日 07:30 cron 自动更新；抓取失败时保留现有页面）
 
 ## 命令一览
 
@@ -69,6 +70,7 @@ sudo bash deploy.sh
 | `/home/wwwroot/blog` | 伪装站点根目录 |
 | `/usr/local/etc/v2ray-deploy/deploy.conf` | 部署元数据（域名 / 路径 / 端口，供用户管理使用） |
 | `/usr/bin/ssl_update.sh` | 证书续期脚本（cron 每周执行） |
+| `/usr/local/bin/qbit-camouflage` | 伪装站每日更新器（抓取量子位资讯生成首页） |
 | `/etc/sysctl.d/99-bbr.conf` | BBR 加速配置 |
 
 ## 卸载

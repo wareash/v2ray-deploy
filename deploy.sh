@@ -98,7 +98,7 @@ install_deps() {
     info "更新软件源并安装依赖 ..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y curl socat unzip git nginx dnsutils qrencode jq iproute2 ca-certificates >/dev/null
+    apt-get install -y curl socat unzip git nginx dnsutils qrencode jq iproute2 python3 ca-certificates >/dev/null
     info "依赖安装完成。"
 }
 
@@ -234,6 +234,9 @@ issue_cert() {
 }
 
 # ---------- 伪装站 ----------
+# 伪装站采用「主题模板 + 每日抓取量子位(qbitai.com)资讯」：先铺好 clean-blog 主题（提供
+# CSS/JS/图片等静态资源），再由 qbit-camouflage 抓取真实资讯生成首页，并配置每日定时更新，
+# 使站点看起来是一个持续更新的真实 AI 资讯站，而非静态假页面。
 deploy_camouflage() {
     info "部署伪装站点到 ${WEBROOT} ..."
     mkdir -p "$WEBROOT"
@@ -244,18 +247,171 @@ deploy_camouflage() {
             https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js 2>/dev/null || true
         [[ -s "$WEBROOT/js/bootstrap.bundle.min.js" ]] && \
             sed -i 's#https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js#js/bootstrap.bundle.min.js#g' "$WEBROOT"/*.html
-        rm -rf "$tmp"; info "伪装博客部署完成。"
+        rm -rf "$tmp"; info "伪装主题部署完成。"
     else
-        warn "拉取模板失败，写入占位页面。"
-        cat > "$WEBROOT/index.html" <<'HTML'
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>DevNotes</title>
-<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:720px;margin:60px auto;padding:0 20px;color:#222;line-height:1.7}</style>
-</head><body><h1>DevNotes</h1><p>Notes on software, systems and the web.</p><hr>
-<h2>A reproducible dev environment with Docker Compose</h2><p><small>May 28, 2026</small></p>
-<p>Stop saying "works on my machine" — pin everything.</p></body></html>
-HTML
+        warn "拉取主题模板失败，将仅依赖抓取内容（页面可能无样式）。"
     fi
+    install_camouflage_updater
+    info "首次抓取量子位资讯生成首页 ..."
+    QBIT_FEED="${QBIT_FEED:-https://www.qbitai.com/feed}" /usr/local/bin/qbit-camouflage "$WEBROOT" || warn "首次抓取失败，保留模板首页。"
+    # 每日 07:30 定时抓取更新
+    ( crontab -l 2>/dev/null | grep -v 'qbit-camouflage'; echo "30 7 * * * /usr/local/bin/qbit-camouflage ${WEBROOT} >/var/log/qbit-camouflage.log 2>&1" ) | crontab -
+    info "已配置每日 07:30 自动抓取更新伪装站内容。"
+}
+
+# 安装伪装站每日更新器：抓取量子位 RSS 生成首页（抓取失败时保留现有页面）
+install_camouflage_updater() {
+    info "安装伪装站更新器 /usr/local/bin/qbit-camouflage ..."
+    cat > /usr/local/bin/qbit-camouflage <<'UPDATER'
+#!/usr/bin/env bash
+# qbit-camouflage：抓取量子位(qbitai.com) RSS，生成伪装站首页 index.html。
+# 用法：qbit-camouflage [webroot]   （默认 /home/wwwroot/blog）
+# 抓取/解析失败时保留现有页面，绝不写出空页面。
+set -u
+WEBROOT="${1:-/home/wwwroot/blog}"
+FEED="${QBIT_FEED:-https://www.qbitai.com/feed}"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+[ -d "$WEBROOT" ] || mkdir -p "$WEBROOT"
+TMP="$(mktemp)"; OUT="$(mktemp)"
+trap 'rm -f "$TMP" "$OUT"' EXIT
+
+if ! curl -fsSL --max-time 30 -A "$UA" "$FEED" -o "$TMP" || [ ! -s "$TMP" ]; then
+    echo "[qbit-camouflage] RSS 获取失败，保留现有页面" >&2
+    exit 0
+fi
+
+if ! FEED_FILE="$TMP" python3 - "$OUT" <<'PYEOF'
+import sys, os, html, datetime, email.utils
+import xml.etree.ElementTree as ET
+
+feed_file = os.environ["FEED_FILE"]
+out_file = sys.argv[1]
+DC = "{http://purl.org/dc/elements/1.1/}creator"
+
+try:
+    items = ET.parse(feed_file).findall(".//item")
+except Exception as e:
+    sys.stderr.write("parse error: %s\n" % e)
+    sys.exit(1)
+
+if not items:
+    sys.exit(1)
+
+def fmt(pub):
+    try:
+        dt = email.utils.parsedate_to_datetime(pub)
+        return dt.astimezone(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y年%m月%d日 %H:%M")
+    except Exception:
+        return pub
+
+posts = []
+for it in items[:12]:
+    title = html.escape((it.findtext("title") or "").strip())
+    link = html.escape((it.findtext("link") or "#").strip())
+    desc = html.escape((it.findtext("description") or "").strip())
+    creator = html.escape((it.findtext(DC) or "编辑部").strip())
+    date = html.escape(fmt((it.findtext("pubDate") or "").strip()))
+    if not title:
+        continue
+    sub = ('<h3 class="post-subtitle">%s</h3>' % desc) if desc else ""
+    posts.append(
+        '<div class="post-preview">\n'
+        '  <a href="%s" target="_blank" rel="noopener">\n'
+        '    <h2 class="post-title">%s</h2>\n%s'
+        '  </a>\n'
+        '  <p class="post-meta">由 %s 发布于 %s</p>\n'
+        '</div>\n<hr class="my-4" />' % (link, title, sub, creator, date)
+    )
+
+updated = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+year = datetime.datetime.now().year
+
+page = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <meta name="description" content="智能前线 - 每日追踪人工智能与前沿科技动态" />
+    <meta name="author" content="智能前线" />
+    <title>智能前线 - 每日 AI 与科技前沿速递</title>
+    <link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
+    <script src="https://use.fontawesome.com/releases/v6.3.0/js/all.js" crossorigin="anonymous"></script>
+    <link href="https://fonts.googleapis.com/css?family=Lora:400,700,400italic,700italic" rel="stylesheet" type="text/css" />
+    <link href="https://fonts.googleapis.com/css?family=Open+Sans:300italic,400italic,600italic,700italic,800italic,400,300,600,700,800" rel="stylesheet" type="text/css" />
+    <link href="css/styles.css" rel="stylesheet" />
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light" id="mainNav">
+        <div class="container px-4 px-lg-5">
+            <a class="navbar-brand" href="index.html">智能前线</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarResponsive" aria-controls="navbarResponsive" aria-expanded="false" aria-label="Toggle navigation">
+                菜单 <i class="fas fa-bars"></i>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarResponsive">
+                <ul class="navbar-nav ms-auto py-4 py-lg-0">
+                    <li class="nav-item"><a class="nav-link px-lg-3 py-3 py-lg-4" href="index.html">首页</a></li>
+                    <li class="nav-item"><a class="nav-link px-lg-3 py-3 py-lg-4" href="about.html">关于</a></li>
+                    <li class="nav-item"><a class="nav-link px-lg-3 py-3 py-lg-4" href="contact.html">联系</a></li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+    <header class="masthead" style="background-image: url('assets/img/home-bg.jpg')">
+        <div class="container position-relative px-4 px-lg-5">
+            <div class="row gx-4 gx-lg-5 justify-content-center">
+                <div class="col-md-10 col-lg-8 col-xl-7">
+                    <div class="site-heading">
+                        <h1>智能前线</h1>
+                        <span class="subheading">每日追踪人工智能与前沿科技动态</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+    <div class="container px-4 px-lg-5">
+        <div class="row gx-4 gx-lg-5 justify-content-center">
+            <div class="col-md-10 col-lg-8 col-xl-7">
+__POSTS__
+                <div class="small text-center text-muted fst-italic mb-4">内容每日更新 · 最近更新：__UPDATED__</div>
+            </div>
+        </div>
+    </div>
+    <footer class="border-top">
+        <div class="container px-4 px-lg-5">
+            <div class="row gx-4 gx-lg-5 justify-content-center">
+                <div class="col-md-10 col-lg-8 col-xl-7">
+                    <div class="small text-center text-muted fst-italic">Copyright &copy; 智能前线 __YEAR__</div>
+                </div>
+            </div>
+        </div>
+    </footer>
+    <script src="js/bootstrap.bundle.min.js"></script>
+    <script src="js/scripts.js"></script>
+</body>
+</html>
+"""
+
+page = page.replace("__POSTS__", "\n".join(posts))
+page = page.replace("__UPDATED__", updated)
+page = page.replace("__YEAR__", str(year))
+
+with open(out_file, "w", encoding="utf-8") as f:
+    f.write(page)
+PYEOF
+then
+    echo "[qbit-camouflage] 生成失败，保留现有页面" >&2
+    exit 0
+fi
+
+if [ -s "$OUT" ]; then
+    install -m 644 "$OUT" "$WEBROOT/index.html"
+    echo "[qbit-camouflage] 已更新 $WEBROOT/index.html （$(date '+%Y-%m-%d %H:%M:%S')）"
+else
+    echo "[qbit-camouflage] 生成内容为空，保留现有页面" >&2
+fi
+UPDATER
+    chmod +x /usr/local/bin/qbit-camouflage
 }
 
 # ---------- 写 V2Ray 配置（初始单用户，email=admin）----------
@@ -535,9 +691,9 @@ do_uninstall() {
     rm -f "$NGINX_CONF" 2>/dev/null || true
     systemctl restart nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
 
-    info "移除证书续期任务 ..."
-    crontab -l 2>/dev/null | grep -v 'ssl_update.sh' | crontab - 2>/dev/null || true
-    rm -f /usr/bin/ssl_update.sh 2>/dev/null || true
+    info "移除证书续期与伪装站更新任务 ..."
+    crontab -l 2>/dev/null | grep -vE 'ssl_update.sh|qbit-camouflage' | crontab - 2>/dev/null || true
+    rm -f /usr/bin/ssl_update.sh /usr/local/bin/qbit-camouflage /var/log/qbit-camouflage.log 2>/dev/null || true
 
     ask "是否删除证书 ${CERT_DIR} 与 acme.sh 记录？(y/N)："; read -r dc
     if [[ "${dc,,}" == "y" ]]; then
