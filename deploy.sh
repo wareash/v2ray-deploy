@@ -13,7 +13,7 @@
 #   sudo bash deploy.sh deluser        # 删除用户
 #   sudo bash deploy.sh users          # 查看所有用户及链接
 #   sudo bash deploy.sh bbr            # 开启 BBR 加速
-#   sudo bash deploy.sh upgrade        # 升级：网络优化 + 动态伪装站（兼容旧部署）
+#   sudo bash deploy.sh upgrade        # 升级配置：V2Ray核心/nginx配置/伪装站/证书/元数据（不含BBR）
 #   sudo bash deploy.sh uninstall      # 卸载
 #
 # 说明：install / adduser / users 运行结束会生成 Anywhere(iOS/macOS 客户端) 一键导入
@@ -107,6 +107,8 @@ load_meta() {
         DOMAIN=$(grep -m1 -E '^\s*server_name' "$NGINX_CONF" | awk '{print $2}' | tr -d ';')
     fi
     [[ -z "$DOMAIN" ]] && DOMAIN=$(detect_domain)
+    # 推断真实伪装站根目录（以 nginx 实际服务目录为准，避免误用默认值）
+    local wr; wr=$(detect_webroot); [[ -n "$wr" ]] && WEBROOT="$wr"
     [[ -n "$DOMAIN" && -n "$WS_PATH" ]] || return 1
     save_meta
     return 0
@@ -781,9 +783,9 @@ do_deluser() {
     info "已删除用户：${name}"
 }
 
-# 查看所有用户及链接
-do_users() {
-    check_root; require_installed; need_jq
+# 列出所有用户、打印链接并保存到运行目录信息文件（需先 require_installed）
+list_and_save_users() {
+    need_jq
     local count; count=$(jq '.inbounds[0].settings.clients | length' "$V2RAY_CONFIG")
     info "共 ${count} 个用户（域名：${DOMAIN}，路径：${WS_PATH}）："
     init_info_file
@@ -795,6 +797,9 @@ do_users() {
     done < <(jq -r '.inbounds[0].settings.clients[] | "\(.email // "user")\t\(.id)"' "$V2RAY_CONFIG")
     notify_info_saved
 }
+
+# 查看所有用户及链接
+do_users() { check_root; require_installed; list_and_save_users; }
 
 do_bbr() { check_root; enable_bbr; }
 
@@ -848,27 +853,78 @@ upgrade_camouflage() {
     info "伪装站升级完成，已配置每日 07:30 自动抓取更新。"
 }
 
-# 升级现有部署：开启/刷新网络优化 + 升级动态伪装站（适用于本脚本或旧方式部署的机器）
+# 更新 V2Ray 核心到最新版（官方 fhs 安装脚本，仅更新二进制，不动配置）
+upgrade_core() {
+    info "更新 V2Ray 核心到最新版 ..."
+    local before after
+    before=$(/usr/local/bin/v2ray version 2>/dev/null | head -1 || true)
+    if bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) >/dev/null 2>&1; then
+        after=$(/usr/local/bin/v2ray version 2>/dev/null | head -1 || true)
+        info "V2Ray 核心：${before:-未知} -> ${after:-未知}"
+    else
+        warn "V2Ray 核心更新失败（可能网络问题），保持现有版本。"
+    fi
+}
+
+# 刷新 nginx 站点配置到脚本最新模板。
+# 安全保护：仅当是“脚本标准布局”(apt nginx + 标准 conf 路径 + vmess + 脚本证书) 时才刷新，
+# 否则跳过，避免破坏自定义/手动部署（如 WordPress+VLESS、源码编译版 nginx）。
+upgrade_nginx_conf() {
+    if [[ "${PROTOCOL,,}" != "vmess" ]]; then
+        warn "非 vmess 部署（${PROTOCOL}），跳过 nginx 配置刷新（避免破坏自定义站点）。"; return 0
+    fi
+    if [[ ! -f "$NGINX_CONF" ]]; then
+        warn "未发现脚本标准 nginx 配置 ${NGINX_CONF}（疑似手动/编译版部署），跳过 nginx 配置刷新。"; return 0
+    fi
+    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
+        warn "未发现脚本标准证书 ${CERT_FILE}，跳过 nginx 配置刷新（避免写出引用缺失证书的配置）。"; return 0
+    fi
+    info "刷新 nginx 站点配置到最新模板 ..."
+    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)" 2>/dev/null || true
+    write_nginx_config
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
+        info "nginx 站点配置已刷新。"
+    else
+        warn "新 nginx 配置校验失败，已保留原配置备份，请手动检查：nginx -t"
+    fi
+}
+
+# 检查并续期 TLS 证书（acme.sh）
+upgrade_cert() {
+    if [[ -f "${ACME_HOME}/acme.sh" ]]; then
+        info "检查 / 续期 TLS 证书 ..."
+        "${ACME_HOME}/acme.sh" --cron --home "${ACME_HOME}" >/dev/null 2>&1 || true
+        info "证书续期检查完成（acme.sh 仅在临近到期时实际续期）。"
+    else
+        warn "未检测到 acme.sh，证书可能由其它方式（certbot 等）管理，跳过续期。"
+    fi
+}
+
+# 升级部署相关配置：核心 / nginx配置 / 伪装站 / 证书 / 元数据。
+# 注意：不改动 BBR/网络优化（那是独立命令 deploy.sh bbr）。兼容旧/手动/VLESS 部署。
 do_upgrade() {
     check_root
-    info "===== 升级现有部署 ====="
-    # 1) 网络优化（BBR + 缓冲 + MTU 探测，幂等）
-    enable_bbr
-    # 2) 确定伪装站目录：元数据 > nginx 探测 > 默认值
-    if load_meta 2>/dev/null && [[ -n "${WEBROOT:-}" ]]; then
-        info "从元数据读取伪装站目录：${WEBROOT}"
-    else
-        local wr; wr=$(detect_webroot)
-        if [[ -n "$wr" ]]; then
-            WEBROOT="$wr"; info "从 Nginx 配置探测到伪装站目录：${WEBROOT}"
-        else
-            warn "未能探测伪装站目录，使用默认值：${WEBROOT}"
-        fi
-    fi
-    # 3) 升级伪装站
+    info "===== 升级部署配置（不含 BBR）====="
+    require_installed   # 探测配置路径 + 读取/推断 域名/路径/端口/协议
+    # 确定伪装站目录：以 nginx 实际服务目录为准（权威），探测不到才退回元数据值
+    local wr; wr=$(detect_webroot)
+    [[ -n "$wr" ]] && WEBROOT="$wr"
+    info "伪装站目录：${WEBROOT}"
+    # 1) 更新 V2Ray 核心
+    upgrade_core
+    # 2) 刷新 nginx 站点配置（仅脚本标准布局）
+    upgrade_nginx_conf
+    # 3) 刷新动态伪装站（自动跳过 WordPress 等真实站点）
     upgrade_camouflage
-    info "===== 升级完成 ====="
-    info "网络优化：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)/$(sysctl -n net.core.default_qdisc 2>/dev/null)，TCP缓冲 $(( $(sysctl -n net.core.rmem_max 2>/dev/null)/1024/1024 ))MB"
+    # 4) 证书检查 / 续期
+    upgrade_cert
+    # 5) 刷新元数据并重启校验
+    save_meta
+    restart_v2ray
+    info "===== 升级完成（未改动 BBR；如需网络优化请运行：deploy.sh bbr）====="
+    # 6) 重新生成运行目录信息文件 + Anywhere 链接
+    list_and_save_users
 }
 
 # 卸载
@@ -916,7 +972,7 @@ menu() {
     echo " 3) 删除用户"
     echo " 4) 查看所有用户及链接"
     echo " 5) 开启 BBR 加速"
-    echo " 6) 升级（网络优化 + 动态伪装站）"
+    echo " 6) 升级配置（核心/nginx/伪装站/证书/元数据，不含BBR）"
     echo " 7) 卸载"
     echo " 0) 退出"
     echo -e "${GREEN}=====================================${PLAIN}"
