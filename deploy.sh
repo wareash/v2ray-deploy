@@ -504,25 +504,43 @@ EOF
     ( crontab -l 2>/dev/null | grep -v 'ssl_update.sh'; echo "0 3 * * 0 bash /usr/bin/ssl_update.sh" ) | crontab -
 }
 
-# ---------- BBR 加速 ----------
+# ---------- BBR + 网络优化 ----------
+# 重要：很多云厂商在 /etc/sysctl.conf 里写死了较小的 rmem_max/wmem_max，而该文件由
+# `sysctl --system` 最后加载，会覆盖 /etc/sysctl.d/*.conf 的设置。因此这里把优化项以
+# 受管块的形式追加到 /etc/sysctl.conf 末尾（同文件内后写的生效），确保压过厂商默认值。
+SYSCTL_BEGIN="# >>> v2ray-deploy network tuning >>>"
+SYSCTL_END="# <<< v2ray-deploy network tuning <<<"
 enable_bbr() {
-    info "开启 BBR 加速 ..."
-    if lsmod | grep -q '^tcp_bbr' || sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-        :
-    fi
+    info "开启 BBR 并优化网络参数 ..."
     modprobe tcp_bbr 2>/dev/null || true
-    cat > /etc/sysctl.d/99-bbr.conf <<EOF
+    # 清理旧的独立文件与受管块，避免重复/冲突
+    rm -f /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
+    sed -i "/${SYSCTL_BEGIN}/,/${SYSCTL_END}/d" /etc/sysctl.conf 2>/dev/null || true
+    cat >> /etc/sysctl.conf <<EOF
+${SYSCTL_BEGIN}
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.core.netdev_max_backlog=16384
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_fin_timeout=15
+${SYSCTL_END}
 EOF
     sysctl --system >/dev/null 2>&1 || true
-    local cc qd
+    local cc qd rmem
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-    if [[ "$cc" == "bbr" ]]; then
-        info "BBR 已开启（拥塞控制：${cc}，队列：${qd}）。"
+    rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+    if [[ "$cc" == "bbr" && "$rmem" -ge 33554432 ]]; then
+        info "网络优化已生效（拥塞控制：${cc}，队列：${qd}，TCP缓冲：$((rmem/1024/1024))MB，MTU探测：开）。"
     else
-        warn "未能确认 BBR 已生效（当前：${cc}）。可能内核过旧（需 4.9+），重启后再试。"
+        warn "网络优化未完全生效（cc=${cc}, rmem_max=${rmem}）。内核需 4.9+ 才支持 BBR；可重启后再试。"
     fi
 }
 
@@ -705,7 +723,10 @@ do_uninstall() {
     [[ "${dw,,}" == "y" ]] && rm -rf "$WEBROOT" 2>/dev/null || true
 
     rm -rf "$META_DIR" 2>/dev/null || true
-    info "卸载完成。Nginx 软件包与 BBR 设置保留（如需关闭 BBR 请手动删除 /etc/sysctl.d/99-bbr.conf）。"
+    # 移除网络优化受管块（保留厂商原有的 sysctl 设置）
+    sed -i "/${SYSCTL_BEGIN}/,/${SYSCTL_END}/d" /etc/sysctl.conf 2>/dev/null || true
+    rm -f /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
+    info "卸载完成。Nginx 软件包保留；网络优化(含BBR)已从 /etc/sysctl.conf 移除（重启后恢复）。"
 }
 
 # ---------- 交互菜单 ----------
