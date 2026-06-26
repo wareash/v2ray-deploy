@@ -455,9 +455,13 @@ do_install() {
     echo -e "${GREEN}=================== 部署完成 ===================${PLAIN}"
     echo -e " 伪装网站  : https://${DOMAIN}/"
     echo -e " 协议      : VMess + WebSocket + TLS"
+    echo -e " 地址(add) : ${DOMAIN}"
+    echo -e " 端口(port): 443"
+    echo -e " UUID(id)  : ${UUID}"
     echo -e " 路径(path): ${WS_PATH}"
-    print_user_link "$UUID" "admin"
     echo -e "${GREEN}===============================================${PLAIN}"
+    # 链接与二维码放在最后输出，方便直接复制 / 扫码
+    print_user_link "$UUID" "admin"
 }
 
 # 添加用户：adduser [备注]
