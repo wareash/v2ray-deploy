@@ -13,6 +13,7 @@
 #   sudo bash deploy.sh deluser        # 删除用户
 #   sudo bash deploy.sh users          # 查看所有用户及链接
 #   sudo bash deploy.sh bbr            # 开启 BBR 加速
+#   sudo bash deploy.sh upgrade        # 升级：网络优化 + 动态伪装站（兼容旧部署）
 #   sudo bash deploy.sh uninstall      # 卸载
 
 # 注意：刻意不使用 pipefail。配合 set -e 时，`cmd | grep -m1`/`| head` 会因下游提前
@@ -693,6 +694,79 @@ do_users() {
 
 do_bbr() { check_root; enable_bbr; }
 
+# ---------- 升级（网络优化 + 动态伪装），兼容非本脚本部署 ----------
+# 从 nginx 配置探测伪装站根目录（兼容 apt 版与源码编译版 nginx）
+# 会排除 ACME 验证 / well-known 等非伪装目录，返回第一个合理的站点根目录
+detect_webroot() {
+    local dump roots line r=""
+    if command -v nginx >/dev/null 2>&1; then
+        dump=$(nginx -T 2>/dev/null || true)
+    fi
+    [[ -z "$dump" ]] && dump=$(grep -rhE '^[[:space:]]*root[[:space:]]+[^;]+;' /etc/nginx/ 2>/dev/null || true)
+    roots=$(grep -E '^[[:space:]]*root[[:space:]]' <<<"$dump" | awk '{print $2}' | tr -d ';' || true)
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            *letsencrypt*|*well-known*|*acme*|*challenge*|*.well-known*) continue ;;
+        esac
+        r="$line"; break
+    done <<<"$roots"
+    echo "$r"
+}
+
+# 将（可能是静态的）伪装站升级为「每日抓取量子位资讯」的动态站；幂等
+upgrade_camouflage() {
+    # 安全保护：若现有伪装站是 WordPress 等真实 CMS（本身就是高质量动态伪装），
+    # 则跳过替换，避免破坏正在运行的站点。
+    if [[ -f "$WEBROOT/wp-config.php" || -d "$WEBROOT/wp-content" || -d "$WEBROOT/wp-includes" ]]; then
+        warn "检测到 ${WEBROOT} 为 WordPress 站点（已是高质量动态伪装），跳过伪装站替换。"
+        return 0
+    fi
+    info "升级伪装站为「每日抓取量子位资讯」动态站 -> ${WEBROOT}"
+    mkdir -p "$WEBROOT"
+    # 仅当目录基本为空（无主题且无首页）时才补齐 clean-blog 主题，避免覆盖已有站点
+    if [[ ! -e "$WEBROOT/css" && ! -e "$WEBROOT/index.html" ]]; then
+        local tmp="/tmp/clean-blog-$$"
+        if git clone --depth 1 https://github.com/StartBootstrap/startbootstrap-clean-blog.git "$tmp" >/dev/null 2>&1 && [[ -d "$tmp/dist" ]]; then
+            cp -r "$tmp/dist/." "$WEBROOT/"
+            curl -fsSL --max-time 20 -o "$WEBROOT/js/bootstrap.bundle.min.js" \
+                https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js 2>/dev/null || true
+            rm -rf "$tmp"
+        else
+            warn "拉取主题模板失败，将仅依赖抓取内容生成首页。"
+        fi
+    fi
+    install_camouflage_updater
+    [[ -f "$WEBROOT/index.html" ]] && cp "$WEBROOT/index.html" "$WEBROOT/index.html.bak" 2>/dev/null || true
+    info "抓取量子位资讯生成首页 ..."
+    QBIT_FEED="${QBIT_FEED:-https://www.qbitai.com/feed}" /usr/local/bin/qbit-camouflage "$WEBROOT" || warn "抓取失败，保留现有首页。"
+    ( crontab -l 2>/dev/null | grep -v 'qbit-camouflage'; echo "30 7 * * * /usr/local/bin/qbit-camouflage ${WEBROOT} >/var/log/qbit-camouflage.log 2>&1" ) | crontab -
+    info "伪装站升级完成，已配置每日 07:30 自动抓取更新。"
+}
+
+# 升级现有部署：开启/刷新网络优化 + 升级动态伪装站（适用于本脚本或旧方式部署的机器）
+do_upgrade() {
+    check_root
+    info "===== 升级现有部署 ====="
+    # 1) 网络优化（BBR + 缓冲 + MTU 探测，幂等）
+    enable_bbr
+    # 2) 确定伪装站目录：元数据 > nginx 探测 > 默认值
+    if load_meta 2>/dev/null && [[ -n "${WEBROOT:-}" ]]; then
+        info "从元数据读取伪装站目录：${WEBROOT}"
+    else
+        local wr; wr=$(detect_webroot)
+        if [[ -n "$wr" ]]; then
+            WEBROOT="$wr"; info "从 Nginx 配置探测到伪装站目录：${WEBROOT}"
+        else
+            warn "未能探测伪装站目录，使用默认值：${WEBROOT}"
+        fi
+    fi
+    # 3) 升级伪装站
+    upgrade_camouflage
+    info "===== 升级完成 ====="
+    info "网络优化：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)/$(sysctl -n net.core.default_qdisc 2>/dev/null)，TCP缓冲 $(( $(sysctl -n net.core.rmem_max 2>/dev/null)/1024/1024 ))MB"
+}
+
 # 卸载
 do_uninstall() {
     check_root
@@ -738,17 +812,19 @@ menu() {
     echo " 3) 删除用户"
     echo " 4) 查看所有用户及链接"
     echo " 5) 开启 BBR 加速"
-    echo " 6) 卸载"
+    echo " 6) 升级（网络优化 + 动态伪装站）"
+    echo " 7) 卸载"
     echo " 0) 退出"
     echo -e "${GREEN}=====================================${PLAIN}"
-    ask "请选择操作 [0-6]："; read -r opt
+    ask "请选择操作 [0-7]："; read -r opt
     case "$opt" in
         1) do_install ;;
         2) do_adduser ;;
         3) do_deluser ;;
         4) do_users ;;
         5) do_bbr ;;
-        6) do_uninstall ;;
+        6) do_upgrade ;;
+        7) do_uninstall ;;
         0) exit 0 ;;
         *) error "无效选项。"; exit 1 ;;
     esac
@@ -763,10 +839,11 @@ main() {
         deluser)        do_deluser ;;
         users|list)     do_users ;;
         bbr)            do_bbr ;;
+        upgrade)        do_upgrade ;;
         uninstall)      do_uninstall ;;
         menu|"")        menu ;;
-        -h|--help|help) sed -n '2,20p' "$0" ;;
-        *) error "未知命令：$cmd"; sed -n '12,20p' "$0"; exit 1 ;;
+        -h|--help|help) sed -n '2,21p' "$0" ;;
+        *) error "未知命令：$cmd"; sed -n '12,21p' "$0"; exit 1 ;;
     esac
 }
 
