@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # deploy.sh
-# 一键部署 V2Ray (VMess + WebSocket + TLS)，使用真实静态网站伪装。
-# 支持：交互式部署 / 域名与IP校验 / BBR 加速 / 多用户管理 / 卸载。
+# 一键部署 V2Ray (VLESS/VMess + WebSocket + TLS)，使用真实静态网站伪装。
+# 支持：交互式部署 / 域名与 IP 校验 / BBR 加速 / 多用户管理 / 卸载。
 #
 # 支持系统：Debian 10+ / Ubuntu 20.04+
 #
@@ -37,7 +37,7 @@ EMAIL=""
 V2RAY_PORT=36649
 WS_PATH=""
 UUID=""
-PROTOCOL="vmess"   # 本脚本部署为 vmess；管理旧/手动部署时会从配置自动探测（可能是 vless）
+PROTOCOL="vless"   # 新部署默认 vless；管理旧/手动部署时会从配置自动探测
 RUN_DIR="$(pwd)"   # 脚本被调用时的工作目录；运行结束把连接信息保存到这里
 INFO_FILE=""       # 运行目录下保存连接信息的文件（init_info_file 时确定）
 CERT_DIR="/data"
@@ -50,16 +50,75 @@ NGINX_CONF="/etc/nginx/conf.d/v2ray.conf"
 META_DIR="/usr/local/etc/v2ray-deploy"
 META_FILE="${META_DIR}/deploy.conf"
 ACME_HOME="${HOME}/.acme.sh"
+LOG_DIR="/var/log/v2ray-deploy"
+INSTALL_LOG=""
+ACME_LOG=""
+BACKUP_DIR=""
+INSTALL_IN_PROGRESS=0
+PKG_MANAGER=""
 
 # ---------- 基础检查 ----------
 check_root() {
     [[ $EUID -eq 0 ]] || { error "请使用 root 权限运行（sudo bash deploy.sh）。"; exit 1; }
 }
 check_os() {
-    command -v apt-get >/dev/null 2>&1 || { error "本脚本仅支持基于 apt 的系统（Debian / Ubuntu）。"; exit 1; }
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    else
+        error "未检测到 apt-get / dnf / yum，无法自动安装依赖。"
+        exit 1
+    fi
+}
+check_systemd() {
+    command -v systemctl >/dev/null 2>&1 || { error "未检测到 systemctl，本脚本需要 systemd 管理 nginx/v2ray。"; exit 1; }
+    systemctl list-units >/dev/null 2>&1 || { error "systemd 不可用，无法管理 nginx/v2ray 服务。"; exit 1; }
 }
 need_jq() {
-    command -v jq >/dev/null 2>&1 || { info "安装 jq ..."; apt-get update -y >/dev/null; apt-get install -y jq >/dev/null; }
+    command -v jq >/dev/null 2>&1 && return 0
+    info "安装 jq ..."
+    install_packages jq
+}
+setup_logging() {
+    mkdir -p "$LOG_DIR"
+    INSTALL_LOG="${LOG_DIR}/install-$(date '+%Y%m%d-%H%M%S').log"
+    ACME_LOG="${LOG_DIR}/acme-$(date '+%Y%m%d-%H%M%S').log"
+    touch "$INSTALL_LOG" "$ACME_LOG"
+    chmod 600 "$INSTALL_LOG" "$ACME_LOG"
+    exec > >(tee -a "$INSTALL_LOG") 2>&1
+    info "安装日志：${INSTALL_LOG}"
+}
+begin_transaction() {
+    BACKUP_DIR="${LOG_DIR}/backup-$(date '+%Y%m%d-%H%M%S')"
+    mkdir -p "$BACKUP_DIR"
+    [[ -f "$NGINX_CONF" ]] && cp -a "$NGINX_CONF" "$BACKUP_DIR/nginx-v2ray.conf" 2>/dev/null || true
+    [[ -e /etc/nginx/sites-enabled/default ]] && cp -a /etc/nginx/sites-enabled/default "$BACKUP_DIR/nginx-default" 2>/dev/null || true
+    [[ -f "$V2RAY_CONFIG" ]] && cp -a "$V2RAY_CONFIG" "$BACKUP_DIR/v2ray-config.json" 2>/dev/null || true
+    [[ -f "$META_FILE" ]] && cp -a "$META_FILE" "$BACKUP_DIR/deploy.conf" 2>/dev/null || true
+    [[ -f /etc/sysctl.conf ]] && cp -a /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf" 2>/dev/null || true
+    INSTALL_IN_PROGRESS=1
+    trap 'rollback_on_error $?' ERR
+}
+finish_transaction() {
+    INSTALL_IN_PROGRESS=0
+    trap - ERR
+}
+rollback_on_error() {
+    local rc="$1"
+    [[ "$INSTALL_IN_PROGRESS" -eq 1 ]] || exit "$rc"
+    error "部署失败，开始恢复已备份的配置（备份目录：${BACKUP_DIR}）。"
+    [[ -f "$BACKUP_DIR/nginx-v2ray.conf" ]] && cp -a "$BACKUP_DIR/nginx-v2ray.conf" "$NGINX_CONF" 2>/dev/null || rm -f "$NGINX_CONF" 2>/dev/null || true
+    [[ -f "$BACKUP_DIR/nginx-default" ]] && cp -a "$BACKUP_DIR/nginx-default" /etc/nginx/sites-enabled/default 2>/dev/null || true
+    [[ -f "$BACKUP_DIR/v2ray-config.json" ]] && mkdir -p "$(dirname "$V2RAY_CONFIG")" && cp -a "$BACKUP_DIR/v2ray-config.json" "$V2RAY_CONFIG" 2>/dev/null || true
+    [[ -f "$BACKUP_DIR/deploy.conf" ]] && mkdir -p "$META_DIR" && cp -a "$BACKUP_DIR/deploy.conf" "$META_FILE" 2>/dev/null || true
+    [[ -f "$BACKUP_DIR/sysctl.conf" ]] && cp -a "$BACKUP_DIR/sysctl.conf" /etc/sysctl.conf 2>/dev/null || true
+    nginx -t >/dev/null 2>&1 && systemctl restart nginx >/dev/null 2>&1 || true
+    systemctl restart v2ray >/dev/null 2>&1 || true
+    warn "请查看日志：${INSTALL_LOG:-未初始化}；证书日志：${ACME_LOG:-未初始化}"
+    exit "$rc"
 }
 
 # ---------- 元数据 持久化 / 读取 ----------
@@ -124,11 +183,35 @@ require_installed() {
 }
 
 # ---------- 依赖 ----------
+install_packages() {
+    [[ -n "$PKG_MANAGER" ]] || check_os
+    case "$PKG_MANAGER" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y >/dev/null
+            apt-get install -y "$@" >/dev/null
+            ;;
+        dnf)
+            dnf install -y "$@" >/dev/null
+            ;;
+        yum)
+            yum install -y "$@" >/dev/null
+            ;;
+        *)
+            error "未知包管理器：${PKG_MANAGER:-未检测}"
+            exit 1
+            ;;
+    esac
+}
 install_deps() {
     info "更新软件源并安装依赖 ..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null
-    apt-get install -y curl socat unzip git nginx dnsutils qrencode jq iproute2 python3 ca-certificates >/dev/null
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        install_packages curl socat unzip git nginx dnsutils qrencode jq iproute2 python3 ca-certificates openssl cron
+    else
+        install_packages curl socat unzip git nginx bind-utils qrencode jq iproute python3 ca-certificates openssl cronie
+        systemctl enable crond >/dev/null 2>&1 || true
+        systemctl start crond >/dev/null 2>&1 || true
+    fi
     info "依赖安装完成。"
 }
 
@@ -138,6 +221,14 @@ get_public_ip() {
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip" "https://4.ipw.cn"; do
         ip=$(curl -s4 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]') || true
         [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+get_public_ipv6() {
+    local ip=""
+    for url in "https://api64.ipify.org" "https://ifconfig.co/ip"; do
+        ip=$(curl -s6 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]') || true
+        [[ "$ip" == *:* ]] && { echo "$ip"; return 0; }
     done
     return 1
 }
@@ -154,14 +245,48 @@ resolve_domain() {
     fi
     echo "$ip"
 }
+resolve_domain_v6() {
+    local domain="$1" ip="" out=""
+    if command -v dig >/dev/null 2>&1; then
+        out=$(dig +short AAAA "$domain" @1.1.1.1 2>/dev/null || true)
+        [[ -z "$out" ]] && out=$(dig +short AAAA "$domain" 2>/dev/null || true)
+        ip=$(grep ':' <<<"$out" | head -1 || true)
+    fi
+    if [[ -z "$ip" ]] && command -v getent >/dev/null 2>&1; then
+        out=$(getent ahostsv6 "$domain" 2>/dev/null || true)
+        ip=$(awk '{print $1}' <<<"$out" | head -1 || true)
+    fi
+    echo "$ip"
+}
+check_required_ports() {
+    local listening owners
+    listening=$(ss -tlnp 2>/dev/null || true)
+    for p in 80 443; do
+        owners=$(awk -v port=":${p}" '$4 ~ port"$" {print}' <<<"$listening" || true)
+        [[ -z "$owners" ]] && continue
+        if grep -q 'nginx' <<<"$owners"; then
+            info "端口 ${p} 当前由 nginx 占用，证书签发时会临时停止 nginx。"
+        else
+            error "端口 ${p} 已被非 nginx 进程占用："
+            echo "$owners"
+            error "请释放端口 ${p} 后再部署。"
+            exit 1
+        fi
+    done
+}
 
 # ---------- 交互：域名输入与校验 ----------
 input_and_verify_domain() {
-    local server_ip
+    local server_ip server_ipv6
     if server_ip=$(get_public_ip); then
         info "检测到本机公网 IP：${GREEN}${server_ip}${PLAIN}"
     else
         warn "无法自动获取本机公网 IP，将跳过自动比对。"; server_ip=""
+    fi
+    if server_ipv6=$(get_public_ipv6); then
+        info "检测到本机公网 IPv6：${GREEN}${server_ipv6}${PLAIN}"
+    else
+        server_ipv6=""
     fi
 
     while true; do
@@ -173,12 +298,24 @@ input_and_verify_domain() {
             error "域名格式不正确：$DOMAIN"; continue
         fi
 
-        info "正在解析 ${DOMAIN} 的 A 记录 ..."
-        local domain_ip; domain_ip=$(resolve_domain "$DOMAIN")
+        info "正在解析 ${DOMAIN} 的 A / AAAA 记录 ..."
+        local domain_ip domain_ipv6
+        domain_ip=$(resolve_domain "$DOMAIN")
+        domain_ipv6=$(resolve_domain_v6 "$DOMAIN")
         [[ -n "$domain_ip" ]] && info "域名解析结果：${GREEN}${domain_ip}${PLAIN}" || warn "未能解析到 ${DOMAIN} 的 A 记录。"
+        [[ -n "$domain_ipv6" ]] && info "域名 AAAA 解析结果：${GREEN}${domain_ipv6}${PLAIN}"
 
         if [[ -n "$server_ip" && -n "$domain_ip" ]]; then
             if [[ "$domain_ip" == "$server_ip" ]]; then
+                if [[ -n "$domain_ipv6" && -z "$server_ipv6" ]]; then
+                    warn "域名存在 AAAA 记录 (${domain_ipv6})，但本机未检测到公网 IPv6；部分客户端可能优先连接 IPv6 后失败。"
+                    ask "是否仍要继续？(y/N)："; read -r v6c
+                    [[ "${v6c,,}" == "y" ]] || continue
+                elif [[ -n "$domain_ipv6" && -n "$server_ipv6" && "$domain_ipv6" != "$server_ipv6" ]]; then
+                    warn "域名 AAAA (${domain_ipv6}) 与本机 IPv6 (${server_ipv6}) 不一致；部分客户端可能连接失败。"
+                    ask "是否仍要继续？(y/N)："; read -r v6f
+                    [[ "${v6f,,}" == "y" ]] || continue
+                fi
                 info "校验通过：域名已正确指向本机 (${server_ip})。"; break
             else
                 error "域名解析 IP (${domain_ip}) 与本机公网 IP (${server_ip}) 不一致！"
@@ -200,7 +337,7 @@ input_and_verify_domain() {
 install_v2ray() {
     if [[ -x /usr/local/bin/v2ray ]]; then info "已安装 V2Ray，跳过。"; return; fi
     info "安装 V2Ray（官方 v2fly 脚本）..."
-    bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) >/dev/null
+    bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)
     info "V2Ray 安装完成。"
 }
 
@@ -227,7 +364,7 @@ detect_v2ray_config_path() {
 
 gen_identifiers() {
     UUID=$(gen_uuid)
-    WS_PATH="/$(head /dev/urandom | tr -dc 'a-f0-9' | head -c8)/"
+    WS_PATH="/$(head /dev/urandom | tr -dc 'a-f0-9' | head -c16)"
     info "已生成 UUID：${UUID}"
     info "已生成 WebSocket 暗道路径：${WS_PATH}"
 }
@@ -235,29 +372,43 @@ gen_uuid() {
     if [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid
     else /usr/local/bin/v2ray uuid 2>/dev/null || head /dev/urandom | tr -dc 'a-f0-9' | head -c32; fi
 }
+choose_protocol() {
+    ask "请选择协议：1) VLESS + WS + TLS（推荐，回车默认）  2) VMess + WS + TLS："
+    read -r p
+    case "${p:-1}" in
+        1) PROTOCOL="vless" ;;
+        2) PROTOCOL="vmess" ;;
+        *) warn "输入无效，默认使用 VLESS。"; PROTOCOL="vless" ;;
+    esac
+    info "已选择协议：${PROTOCOL}"
+}
 
 # ---------- 证书 ----------
 issue_cert() {
     mkdir -p "$CERT_DIR"
-    [[ -f "${ACME_HOME}/acme.sh" ]] || { info "安装 acme.sh ..."; curl -fsSL https://get.acme.sh | sh -s email="$EMAIL" >/dev/null; }
-    "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    "${ACME_HOME}/acme.sh" --register-account -m "$EMAIL" >/dev/null 2>&1 || true
+    [[ -n "$ACME_LOG" ]] || ACME_LOG="${LOG_DIR}/acme-$(date '+%Y%m%d-%H%M%S').log"
+    mkdir -p "$LOG_DIR"; touch "$ACME_LOG"; chmod 600 "$ACME_LOG"
+    [[ -f "${ACME_HOME}/acme.sh" ]] || { info "安装 acme.sh ..."; curl -fsSL https://get.acme.sh | sh -s email="$EMAIL" >>"$ACME_LOG" 2>&1; }
+    "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt >>"$ACME_LOG" 2>&1 || true
+    "${ACME_HOME}/acme.sh" --register-account -m "$EMAIL" >>"$ACME_LOG" 2>&1 || true
     info "通过 standalone 模式签发证书（临时占用 80 端口）..."
     systemctl stop nginx >/dev/null 2>&1 || true
     # acme.sh --issue 退出码：0=成功签发，2=证书已存在且无需续期（跳过）。两者都视为正常；
     # 其它非零码才是真正失败。这样重复运行 install 时不会因"已有证书"被误判为失败。
     local rc=0
-    "${ACME_HOME}/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 >/dev/null 2>&1 || rc=$?
+    "${ACME_HOME}/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 >>"$ACME_LOG" 2>&1 || rc=$?
     if [[ $rc -ne 0 && $rc -ne 2 ]]; then
         error "证书签发失败（acme.sh 退出码 ${rc}）。请确认 80 端口空闲、域名已解析、防火墙放行 80/443。"
+        warn "证书日志：${ACME_LOG}"
         systemctl start nginx >/dev/null 2>&1 || true; exit 1
     fi
     # 安装/复制证书到目标路径
     "${ACME_HOME}/acme.sh" --install-cert -d "$DOMAIN" --ecc \
-        --fullchain-file "$CERT_FILE" --key-file "$KEY_FILE" >/dev/null 2>&1 || true
+        --fullchain-file "$CERT_FILE" --key-file "$KEY_FILE" >>"$ACME_LOG" 2>&1 || true
     # 以"证书文件是否真正生成"作为最终成功判据，避免退出码歧义
     if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
         error "证书文件未生成（${CERT_FILE} / ${KEY_FILE}）。请检查 acme.sh 日志：${ACME_HOME}/acme.sh --info -d ${DOMAIN}"
+        warn "证书日志：${ACME_LOG}"
         systemctl start nginx >/dev/null 2>&1 || true; exit 1
     fi
     info "证书就绪：${CERT_FILE}"
@@ -281,11 +432,11 @@ deploy_camouflage() {
     else
         warn "拉取主题模板失败，将仅依赖抓取内容（页面可能无样式）。"
     fi
+    ensure_fallback_camouflage
     install_camouflage_updater
     info "首次抓取量子位资讯生成首页 ..."
     QBIT_FEED="${QBIT_FEED:-https://www.qbitai.com/feed}" /usr/local/bin/qbit-camouflage "$WEBROOT" || warn "首次抓取失败，保留模板首页。"
-    # 每日 07:30 定时抓取更新
-    ( crontab -l 2>/dev/null | grep -v 'qbit-camouflage'; echo "30 7 * * * /usr/local/bin/qbit-camouflage ${WEBROOT} >/var/log/qbit-camouflage.log 2>&1" ) | crontab -
+    setup_camouflage_timer
     info "已配置每日 07:30 自动抓取更新伪装站内容。"
 }
 
@@ -443,11 +594,52 @@ fi
 UPDATER
     chmod +x /usr/local/bin/qbit-camouflage
 }
+ensure_fallback_camouflage() {
+    [[ -s "$WEBROOT/index.html" ]] && return 0
+    mkdir -p "$WEBROOT"
+    cat > "$WEBROOT/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>智能前线 - 每日 AI 与科技前沿速递</title>
+    <style>
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2937; background: #f8fafc; }
+        main { max-width: 760px; margin: 0 auto; padding: 72px 24px; }
+        h1 { font-size: 42px; line-height: 1.1; margin: 0 0 16px; }
+        p { font-size: 18px; line-height: 1.7; color: #4b5563; }
+        .meta { margin-top: 40px; font-size: 14px; color: #6b7280; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>智能前线</h1>
+    <p>每日追踪人工智能、工程实践与前沿科技动态。内容源正在初始化，稍后将自动更新。</p>
+    <p class="meta">本站内容定时刷新。</p>
+</main>
+</body>
+</html>
+EOF
+}
 
 # ---------- 写 V2Ray 配置（初始单用户，email=admin）----------
 write_v2ray_config() {
     info "写入 V2Ray 配置 ${V2RAY_CONFIG} ..."
     mkdir -p "$(dirname "$V2RAY_CONFIG")" /var/log/v2ray
+    local inbound_tag="${PROTOCOL}-in"
+    local settings
+    if [[ "${PROTOCOL,,}" == "vless" ]]; then
+        settings=$(cat <<EOF
+{ "decryption": "none", "clients": [ { "id": "${UUID}", "email": "admin" } ] }
+EOF
+)
+    else
+        settings=$(cat <<EOF
+{ "clients": [ { "id": "${UUID}", "alterId": 0, "email": "admin" } ] }
+EOF
+)
+    fi
     cat > "$V2RAY_CONFIG" <<EOF
 {
   "log": { "access": "/var/log/v2ray/access.log", "error": "/var/log/v2ray/error.log", "loglevel": "warning" },
@@ -455,9 +647,9 @@ write_v2ray_config() {
     {
       "port": ${V2RAY_PORT},
       "listen": "127.0.0.1",
-      "tag": "vmess-in",
-      "protocol": "vmess",
-      "settings": { "clients": [ { "id": "${UUID}", "alterId": 0, "email": "admin" } ] },
+      "tag": "${inbound_tag}",
+      "protocol": "${PROTOCOL}",
+      "settings": ${settings},
       "streamSettings": { "network": "ws", "wsSettings": { "path": "${WS_PATH}" } }
     }
   ],
@@ -465,7 +657,7 @@ write_v2ray_config() {
     { "protocol": "freedom", "settings": {}, "tag": "direct" },
     { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
   ],
-  "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["vmess-in"], "outboundTag": "direct" } ] }
+  "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["${inbound_tag}"], "outboundTag": "direct" } ] }
 }
 EOF
     # 官方 v2ray 服务以 User=nobody 运行，必须保证配置文件对其可读
@@ -496,7 +688,15 @@ server {
     ssl_ciphers           ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
     ssl_session_timeout   1d;
     ssl_session_cache     shared:SSL:10m;
-    add_header Strict-Transport-Security "max-age=31536000";
+    ssl_session_tickets   off;
+    ssl_stapling          on;
+    ssl_stapling_verify   on;
+    resolver              1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout      5s;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     root  ${WEBROOT};
     index index.html index.htm;
@@ -531,7 +731,61 @@ sleep 1
 systemctl start nginx >/dev/null 2>&1
 EOF
     chmod +x /usr/bin/ssl_update.sh
-    ( crontab -l 2>/dev/null | grep -v 'ssl_update.sh'; echo "0 3 * * 0 bash /usr/bin/ssl_update.sh" ) | crontab -
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-units >/dev/null 2>&1; then
+        cat > /etc/systemd/system/v2ray-deploy-cert-renew.service <<EOF
+[Unit]
+Description=Renew v2ray-deploy TLS certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssl_update.sh
+EOF
+        cat > /etc/systemd/system/v2ray-deploy-cert-renew.timer <<EOF
+[Unit]
+Description=Weekly v2ray-deploy TLS certificate renewal
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now v2ray-deploy-cert-renew.timer >/dev/null 2>&1 || true
+        ( crontab -l 2>/dev/null | grep -v 'ssl_update.sh' ) | crontab - 2>/dev/null || true
+    else
+        ( crontab -l 2>/dev/null | grep -v 'ssl_update.sh'; echo "0 3 * * 0 bash /usr/bin/ssl_update.sh" ) | crontab -
+    fi
+}
+setup_camouflage_timer() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-units >/dev/null 2>&1; then
+        cat > /etc/systemd/system/qbit-camouflage.service <<EOF
+[Unit]
+Description=Refresh v2ray-deploy camouflage site
+
+[Service]
+Type=oneshot
+Environment=QBIT_FEED=${QBIT_FEED:-https://www.qbitai.com/feed}
+ExecStart=/bin/sh -c '/usr/local/bin/qbit-camouflage "${WEBROOT}" >>/var/log/qbit-camouflage.log 2>&1'
+EOF
+        cat > /etc/systemd/system/qbit-camouflage.timer <<EOF
+[Unit]
+Description=Daily v2ray-deploy camouflage refresh
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now qbit-camouflage.timer >/dev/null 2>&1 || true
+        ( crontab -l 2>/dev/null | grep -v 'qbit-camouflage' ) | crontab - 2>/dev/null || true
+    else
+        ( crontab -l 2>/dev/null | grep -v 'qbit-camouflage'; echo "30 7 * * * /usr/local/bin/qbit-camouflage ${WEBROOT} >/var/log/qbit-camouflage.log 2>&1" ) | crontab -
+    fi
 }
 
 # ---------- BBR + 网络优化 ----------
@@ -626,6 +880,7 @@ init_info_file() {
         echo "# Anywhere 客户端：https://apps.apple.com/us/app/id6758235178"
         echo
     } > "$INFO_FILE" 2>/dev/null || { warn "无法写入运行目录 ${RUN_DIR}，跳过信息保存。"; INFO_FILE=""; }
+    [[ -n "$INFO_FILE" ]] && chmod 600 "$INFO_FILE" 2>/dev/null || true
 }
 
 # 追加一条用户记录到信息文件
@@ -638,6 +893,7 @@ append_info() {  # <uuid> <name> <link> <anywhere_link>
         echo "Anywhere 一键导入：$4"
         echo "----------------------------------------"
     } >> "$INFO_FILE" 2>/dev/null || true
+    chmod 600 "$INFO_FILE" 2>/dev/null || true
 }
 
 print_user_link() {
@@ -673,6 +929,7 @@ start_services() {
     systemctl enable v2ray >/dev/null 2>&1 || true; systemctl restart v2ray
     systemctl enable nginx >/dev/null 2>&1 || true; systemctl restart nginx
     verify_listening
+    verify_https
 }
 
 # 启动后健康检查：确认 V2Ray 真的监听了端口（避免“服务 active 却没监听”导致的 502）
@@ -695,6 +952,25 @@ verify_listening() {
         exit 1
     fi
 }
+verify_https() {
+    local cert_subject curl_code
+    if command -v openssl >/dev/null 2>&1 && [[ -s "$CERT_FILE" ]]; then
+        cert_subject=$(openssl x509 -in "$CERT_FILE" -noout -subject -ext subjectAltName 2>/dev/null || true)
+        if grep -q "DNS:${DOMAIN}" <<<"$cert_subject"; then
+            info "证书检查通过：证书包含 ${DOMAIN}。"
+        else
+            warn "证书未明确匹配 ${DOMAIN}，请检查：openssl x509 -in ${CERT_FILE} -noout -text"
+        fi
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl_code=$(curl -k -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${DOMAIN}/" 2>/dev/null || true)
+        if [[ "$curl_code" =~ ^(200|301|302|403)$ ]]; then
+            info "HTTPS 检查通过：https://${DOMAIN}/ 返回 ${curl_code}。"
+        else
+            warn "HTTPS 检查未通过（HTTP ${curl_code:-无响应}）。请确认云安全组/防火墙已放行 443。"
+        fi
+    fi
+}
 
 restart_v2ray() {
     /usr/local/bin/v2ray test -c "$V2RAY_CONFIG" >/dev/null
@@ -705,9 +981,13 @@ restart_v2ray() {
 # ====================== 子命令 ======================
 
 do_install() {
-    check_root; check_os
+    check_root; check_os; check_systemd; setup_logging
+    detect_v2ray_config_path
+    begin_transaction
     install_deps
     input_and_verify_domain
+    check_required_ports
+    choose_protocol
     install_v2ray
     detect_v2ray_config_path
     gen_identifiers
@@ -717,13 +997,14 @@ do_install() {
     write_nginx_config
     setup_renew
     save_meta
-    ask "是否同时开启 BBR 加速？(Y/n)："; read -r b
-    [[ "${b,,}" != "n" ]] && enable_bbr
+    ask "是否同时开启 BBR 加速并修改系统网络参数？(y/N)："; read -r b
+    [[ "${b,,}" == "y" ]] && enable_bbr
     start_services
+    finish_transaction
     echo
     echo -e "${GREEN}=================== 部署完成 ===================${PLAIN}"
     echo -e " 伪装网站  : https://${DOMAIN}/"
-    echo -e " 协议      : VMess + WebSocket + TLS"
+    echo -e " 协议      : ${PROTOCOL^^} + WebSocket + TLS"
     echo -e " 地址(add) : ${DOMAIN}"
     echo -e " 端口(port): 443"
     echo -e " UUID(id)  : ${UUID}"
@@ -801,7 +1082,7 @@ list_and_save_users() {
 # 查看所有用户及链接
 do_users() { check_root; require_installed; list_and_save_users; }
 
-do_bbr() { check_root; enable_bbr; }
+do_bbr() { check_root; check_os; enable_bbr; }
 
 # ---------- 升级（网络优化 + 动态伪装），兼容非本脚本部署 ----------
 # 从 nginx 配置探测伪装站根目录（兼容 apt 版与源码编译版 nginx）
@@ -845,11 +1126,12 @@ upgrade_camouflage() {
             warn "拉取主题模板失败，将仅依赖抓取内容生成首页。"
         fi
     fi
+    ensure_fallback_camouflage
     install_camouflage_updater
     [[ -f "$WEBROOT/index.html" ]] && cp "$WEBROOT/index.html" "$WEBROOT/index.html.bak" 2>/dev/null || true
     info "抓取量子位资讯生成首页 ..."
     QBIT_FEED="${QBIT_FEED:-https://www.qbitai.com/feed}" /usr/local/bin/qbit-camouflage "$WEBROOT" || warn "抓取失败，保留现有首页。"
-    ( crontab -l 2>/dev/null | grep -v 'qbit-camouflage'; echo "30 7 * * * /usr/local/bin/qbit-camouflage ${WEBROOT} >/var/log/qbit-camouflage.log 2>&1" ) | crontab -
+    setup_camouflage_timer
     info "伪装站升级完成，已配置每日 07:30 自动抓取更新。"
 }
 
@@ -867,12 +1149,9 @@ upgrade_core() {
 }
 
 # 刷新 nginx 站点配置到脚本最新模板。
-# 安全保护：仅当是“脚本标准布局”(apt nginx + 标准 conf 路径 + vmess + 脚本证书) 时才刷新，
+# 安全保护：仅当是“脚本标准布局”(apt nginx + 标准 conf 路径 + 脚本证书) 时才刷新，
 # 否则跳过，避免破坏自定义/手动部署（如 WordPress+VLESS、源码编译版 nginx）。
 upgrade_nginx_conf() {
-    if [[ "${PROTOCOL,,}" != "vmess" ]]; then
-        warn "非 vmess 部署（${PROTOCOL}），跳过 nginx 配置刷新（避免破坏自定义站点）。"; return 0
-    fi
     if [[ ! -f "$NGINX_CONF" ]]; then
         warn "未发现脚本标准 nginx 配置 ${NGINX_CONF}（疑似手动/编译版部署），跳过 nginx 配置刷新。"; return 0
     fi
@@ -904,7 +1183,7 @@ upgrade_cert() {
 # 升级部署相关配置：核心 / nginx配置 / 伪装站 / 证书 / 元数据。
 # 注意：不改动 BBR/网络优化（那是独立命令 deploy.sh bbr）。兼容旧/手动/VLESS 部署。
 do_upgrade() {
-    check_root
+    check_root; check_os; check_systemd; setup_logging
     info "===== 升级部署配置（不含 BBR）====="
     require_installed   # 探测配置路径 + 读取/推断 域名/路径/端口/协议
     # 确定伪装站目录：以 nginx 实际服务目录为准（权威），探测不到才退回元数据值
@@ -945,6 +1224,12 @@ do_uninstall() {
 
     info "移除证书续期与伪装站更新任务 ..."
     crontab -l 2>/dev/null | grep -vE 'ssl_update.sh|qbit-camouflage' | crontab - 2>/dev/null || true
+    systemctl disable --now v2ray-deploy-cert-renew.timer qbit-camouflage.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/v2ray-deploy-cert-renew.service \
+          /etc/systemd/system/v2ray-deploy-cert-renew.timer \
+          /etc/systemd/system/qbit-camouflage.service \
+          /etc/systemd/system/qbit-camouflage.timer 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
     rm -f /usr/bin/ssl_update.sh /usr/local/bin/qbit-camouflage /var/log/qbit-camouflage.log 2>/dev/null || true
 
     ask "是否删除证书 ${CERT_DIR} 与 acme.sh 记录？(y/N)："; read -r dc
