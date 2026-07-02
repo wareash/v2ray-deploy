@@ -26,6 +26,11 @@ sudo bash deploy.sh install     # 部署
 sudo bash deploy.sh adduser     # 添加用户（也可 adduser alice 直接指定备注）
 sudo bash deploy.sh deluser     # 删除用户（按序号）
 sudo bash deploy.sh users       # 查看所有用户及各自连接链接/二维码
+sudo bash deploy.sh export      # 导出 v2ray / sing-box / Clash 客户端配置
+sudo bash deploy.sh status      # 查看服务状态、监听端口与健康检查
+sudo bash deploy.sh logs        # 查看日志（可选：v2ray/nginx/access/error/deploy）
+sudo bash deploy.sh path /ray   # 修改 WebSocket 路径
+sudo bash deploy.sh port 8443   # 修改公网连接端口
 sudo bash deploy.sh bbr         # 开启 BBR 加速
 sudo bash deploy.sh upgrade     # 升级配置：V2Ray核心 / nginx站点配置 / 动态伪装站 / TLS证书续期 / 元数据（不含BBR，BBR请用 bbr 命令）
 sudo bash deploy.sh uninstall   # 卸载
@@ -52,6 +57,7 @@ anywhere://add-proxy?link=<分享链接>
 ```
 
 - 同时把全部连接信息（分享链接 + Anywhere 链接）保存到**运行目录**下的 `v2ray-<域名>-info.txt`，文件权限会设置为 `600`。
+- 同时导出 v2ray JSON、sing-box JSON 和 Clash proxy YAML 到 `v2ray-<域名>-clients/`，目录权限会设置为 `700`。
 - 注意：Anywhere **不支持 vmess**，一键导入仅对 `vless` 等协议有效；vmess 节点请用分享链接/二维码导入支持 vmess 的客户端。
 
 ## 适用系统
@@ -59,7 +65,7 @@ anywhere://add-proxy?link=<分享链接>
 - Debian 10+ / Ubuntu 20.04+，以及带 systemd 的 RHEL/CentOS/Alma/Rocky 系发行版（通过 dnf/yum 安装依赖）
 - 需 root 权限
 - 需提前将域名的 A 记录解析到本机公网 IP；如果配置 AAAA 记录，也需指向本机公网 IPv6
-- 云服务器安全组/防火墙需放行 **80 / 443** 端口
+- 云服务器安全组/防火墙需放行 **80** 和你选择的公网连接端口（默认 **443**）
 
 ## 使用方法
 
@@ -71,19 +77,20 @@ curl -fsSLO https://raw.githubusercontent.com/wareash/v2ray-deploy/main/deploy.s
 sudo bash deploy.sh
 ```
 
-运行后按提示输入域名、邮箱和协议选择即可。脚本会：
+运行后按提示输入域名、邮箱、公网端口和协议选择即可。脚本会：
 
 1. 检测本机公网 IP
 2. 解析你输入的域名并与本机 IP 比对
-3. 选择协议（默认 VLESS，可选 VMess）
-4. 校验通过后自动完成依赖安装、证书签发、V2Ray/Nginx 配置、伪装站部署与服务启动
-5. 在终端输出客户端连接信息、分享链接与二维码
+3. 选择公网连接端口（默认 443，不能使用 80）
+4. 选择协议（默认 VLESS，可选 VMess）
+5. 校验通过后自动完成依赖安装、证书签发、V2Ray/Nginx 配置、伪装站部署与服务启动
+6. 在终端输出客户端连接信息、分享链接与二维码，并导出客户端配置文件
 
 ## 部署架构
 
 ```
-客户端 ──TLS:443(域名)──▶ Nginx ──┬─▶ 普通访问  → 伪装博客（静态网站）
-                                  └─▶ 暗道路径  → WebSocket → V2Ray VLESS/VMess(127.0.0.1)
+客户端 ──TLS:公网端口(域名)──▶ Nginx ──┬─▶ 普通访问  → 伪装博客（静态网站）
+                                      └─▶ 暗道路径  → WebSocket → V2Ray VLESS/VMess(127.0.0.1)
 ```
 
 ## 关键文件
@@ -95,6 +102,7 @@ sudo bash deploy.sh
 | `/data/v2ray.crt` `/data/v2ray.key` | TLS 证书与私钥 |
 | `/home/wwwroot/blog` | 伪装站点根目录 |
 | `/usr/local/etc/v2ray-deploy/deploy.conf` | 部署元数据（域名 / 路径 / 端口，供用户管理使用） |
+| `运行目录/v2ray-<域名>-clients/` | v2ray / sing-box / Clash 客户端配置导出目录 |
 | `/var/log/v2ray-deploy/` | 安装日志、证书日志、失败恢复备份 |
 | `/usr/bin/ssl_update.sh` | 证书续期脚本（systemd timer 每周执行，必要时回退 cron） |
 | `/usr/local/bin/qbit-camouflage` | 伪装站每日更新器（抓取量子位资讯生成首页） |

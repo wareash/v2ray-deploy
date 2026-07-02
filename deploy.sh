@@ -12,6 +12,11 @@
 #   sudo bash deploy.sh adduser [备注] # 添加用户
 #   sudo bash deploy.sh deluser        # 删除用户
 #   sudo bash deploy.sh users          # 查看所有用户及链接
+#   sudo bash deploy.sh export         # 导出 v2ray/sing-box/Clash 客户端配置
+#   sudo bash deploy.sh status         # 查看服务状态与健康检查
+#   sudo bash deploy.sh logs [类型]    # 查看日志：v2ray/nginx/access/error/deploy
+#   sudo bash deploy.sh path [路径]    # 修改 WebSocket 路径
+#   sudo bash deploy.sh port [端口]    # 修改公网连接端口
 #   sudo bash deploy.sh bbr            # 开启 BBR 加速
 #   sudo bash deploy.sh upgrade        # 升级配置：V2Ray核心/nginx配置/伪装站/证书/元数据（不含BBR）
 #   sudo bash deploy.sh uninstall      # 卸载
@@ -34,6 +39,7 @@ ask()   { echo -ne "${BLUE}[输入]${PLAIN} $*"; }
 # ---------- 路径与默认值 ----------
 DOMAIN=""
 EMAIL=""
+PUBLIC_PORT=443
 V2RAY_PORT=36649
 WS_PATH=""
 UUID=""
@@ -127,6 +133,7 @@ save_meta() {
     cat > "$META_FILE" <<EOF
 DOMAIN="${DOMAIN}"
 WS_PATH="${WS_PATH}"
+PUBLIC_PORT="${PUBLIC_PORT}"
 V2RAY_PORT="${V2RAY_PORT}"
 WEBROOT="${WEBROOT}"
 PROTOCOL="${PROTOCOL}"
@@ -148,6 +155,42 @@ detect_domain() {
         echo "$n"; return 0
     done <<<"$names"
 }
+detect_public_port() {
+    local conf port=""
+    conf=$(nginx -T 2>/dev/null || true)
+    [[ -z "$conf" && -f "$NGINX_CONF" ]] && conf=$(cat "$NGINX_CONF" 2>/dev/null || true)
+    port=$(awk '
+        /^[[:space:]]*listen[[:space:]]+/ && $0 ~ /ssl/ {
+            for (i=1; i<=NF; i++) {
+                gsub(/;/, "", $i)
+                if ($i ~ /^[0-9]+$/) { print $i; exit }
+                if ($i ~ /:[0-9]+$/) { sub(/^.*:/, "", $i); print $i; exit }
+            }
+        }' <<<"$conf")
+    echo "${port:-443}"
+}
+valid_port() {
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+valid_public_port() {
+    local p="$1"
+    valid_port "$p" && [[ "$p" != "80" ]]
+}
+input_public_port() {
+    local p
+    while true; do
+        ask "请输入公网连接端口（回车默认 443）："
+        read -r p
+        p=${p:-443}
+        if valid_public_port "$p"; then
+            PUBLIC_PORT="$p"
+            info "公网连接端口：${PUBLIC_PORT}"
+            return 0
+        fi
+        error "端口无效：${p}（公网 TLS 端口不能使用 80）"
+    done
+}
 
 # 读取元数据；若元数据缺失（如旧脚本部署），尝试从现有配置回退推断
 load_meta() {
@@ -161,6 +204,7 @@ load_meta() {
     WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path // empty' "$V2RAY_CONFIG" 2>/dev/null)
     V2RAY_PORT=$(jq -r '.inbounds[0].port // 36649' "$V2RAY_CONFIG" 2>/dev/null)
     PROTOCOL=$(jq -r '.inbounds[0].protocol // "vmess"' "$V2RAY_CONFIG" 2>/dev/null)
+    PUBLIC_PORT=$(detect_public_port)
     # 域名：优先脚本自身的 NGINX_CONF，其次从全局 nginx 配置探测（兼容手动/旧部署）
     if [[ -f "$NGINX_CONF" ]]; then
         DOMAIN=$(grep -m1 -E '^\s*server_name' "$NGINX_CONF" | awk '{print $2}' | tr -d ';')
@@ -169,6 +213,7 @@ load_meta() {
     # 推断真实伪装站根目录（以 nginx 实际服务目录为准，避免误用默认值）
     local wr; wr=$(detect_webroot); [[ -n "$wr" ]] && WEBROOT="$wr"
     [[ -n "$DOMAIN" && -n "$WS_PATH" ]] || return 1
+    PUBLIC_PORT=${PUBLIC_PORT:-443}
     save_meta
     return 0
 }
@@ -261,7 +306,7 @@ resolve_domain_v6() {
 check_required_ports() {
     local listening owners
     listening=$(ss -tlnp 2>/dev/null || true)
-    for p in 80 443; do
+    for p in 80 "$PUBLIC_PORT"; do
         owners=$(awk -v port=":${p}" '$4 ~ port"$" {print}' <<<"$listening" || true)
         [[ -z "$owners" ]] && continue
         if grep -q 'nginx' <<<"$owners"; then
@@ -398,7 +443,7 @@ issue_cert() {
     local rc=0
     "${ACME_HOME}/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 >>"$ACME_LOG" 2>&1 || rc=$?
     if [[ $rc -ne 0 && $rc -ne 2 ]]; then
-        error "证书签发失败（acme.sh 退出码 ${rc}）。请确认 80 端口空闲、域名已解析、防火墙放行 80/443。"
+        error "证书签发失败（acme.sh 退出码 ${rc}）。请确认 80 端口空闲、域名已解析、防火墙放行 80/${PUBLIC_PORT}。"
         warn "证书日志：${ACME_LOG}"
         systemctl start nginx >/dev/null 2>&1 || true; exit 1
     fi
@@ -678,8 +723,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen ${PUBLIC_PORT} ssl http2;
+    listen [::]:${PUBLIC_PORT} ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate       ${CERT_FILE};
@@ -847,17 +892,17 @@ build_vmess_link() {
     local uuid="$1" ps="$2"
     local json
     json=$(cat <<EOF
-{"v":"2","ps":"${ps}","add":"${DOMAIN}","port":"443","id":"${uuid}","aid":"0","net":"ws","type":"none","host":"${DOMAIN}","path":"${WS_PATH}","tls":"tls"}
+{"v":"2","ps":"${ps}","add":"${DOMAIN}","port":"${PUBLIC_PORT}","id":"${uuid}","aid":"0","net":"ws","type":"none","host":"${DOMAIN}","path":"${WS_PATH}","tls":"tls"}
 EOF
 )
     echo "vmess://$(echo -n "$json" | base64 -w0)"
 }
 
-# 用法：build_vless_link <uuid> <ps备注>（VLESS + WS + TLS，TLS 由 nginx 在 443 终止）
+# 用法：build_vless_link <uuid> <ps备注>（VLESS + WS + TLS，TLS 由 nginx 在公网端口终止）
 build_vless_link() {
     local uuid="$1" ps="$2"
     local p; p=$(urlencode "$WS_PATH")
-    echo "vless://${uuid}@${DOMAIN}:443?encryption=none&security=tls&type=ws&host=${DOMAIN}&sni=${DOMAIN}&path=${p}#$(urlencode "$ps")"
+    echo "vless://${uuid}@${DOMAIN}:${PUBLIC_PORT}?encryption=none&security=tls&type=ws&host=${DOMAIN}&sni=${DOMAIN}&path=${p}#$(urlencode "$ps")"
 }
 
 # 按当前部署协议生成链接
@@ -876,7 +921,7 @@ init_info_file() {
         echo "# V2Ray 连接信息"
         echo "# 生成时间：$(date '+%Y-%m-%d %H:%M:%S')"
         echo "# 伪装网站：https://${DOMAIN}/"
-        echo "# 协议：${PROTOCOL}    地址：${DOMAIN}    端口：443    路径：${WS_PATH}"
+        echo "# 协议：${PROTOCOL}    地址：${DOMAIN}    端口：${PUBLIC_PORT}    路径：${WS_PATH}"
         echo "# Anywhere 客户端：https://apps.apple.com/us/app/id6758235178"
         echo
     } > "$INFO_FILE" 2>/dev/null || { warn "无法写入运行目录 ${RUN_DIR}，跳过信息保存。"; INFO_FILE=""; }
@@ -921,6 +966,106 @@ notify_info_saved() {
     [[ -n "$INFO_FILE" && -f "$INFO_FILE" ]] && info "连接信息已保存到：${GREEN}${INFO_FILE}${PLAIN}"
 }
 
+safe_name() {
+    echo "$1" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//'
+}
+
+export_client_configs() {
+    [[ -n "$DOMAIN" && -n "$WS_PATH" ]] || return 0
+    need_jq
+    local dir="${RUN_DIR}/v2ray-${DOMAIN}-clients"
+    local clash="${dir}/clash-proxies.yaml"
+    mkdir -p "$dir"
+    chmod 700 "$dir" 2>/dev/null || true
+    {
+        echo "proxies:"
+    } > "$clash"
+    while IFS=$'\t' read -r name id; do
+        [[ -z "$id" ]] && continue
+        local n file_n
+        n=${name:-user}
+        file_n=$(safe_name "$n")
+        [[ -n "$file_n" ]] || file_n="user"
+        if [[ "${PROTOCOL,,}" == "vless" ]]; then
+            jq -n \
+                --arg domain "$DOMAIN" --argjson port "$PUBLIC_PORT" --arg id "$id" --arg path "$WS_PATH" \
+                '{
+                  log:{loglevel:"warning"},
+                  inbounds:[{port:1080,listen:"127.0.0.1",protocol:"socks",settings:{auth:"noauth",udp:true}}],
+                  outbounds:[{
+                    protocol:"vless",
+                    settings:{vnext:[{address:$domain,port:$port,users:[{id:$id,encryption:"none"}]}]},
+                    streamSettings:{network:"ws",security:"tls",tlsSettings:{serverName:$domain},wsSettings:{path:$path,headers:{Host:$domain}}}
+                  }]
+                }' > "${dir}/v2ray-${file_n}.json"
+            jq -n \
+                --arg domain "$DOMAIN" --argjson port "$PUBLIC_PORT" --arg id "$id" --arg path "$WS_PATH" \
+                '{
+                  inbounds:[{type:"socks",listen:"127.0.0.1",listen_port:1080}],
+                  outbounds:[{
+                    type:"vless",server:$domain,server_port:$port,uuid:$id,
+                    tls:{enabled:true,server_name:$domain},
+                    transport:{type:"ws",path:$path,headers:{Host:$domain}}
+                  }]
+                }' > "${dir}/sing-box-${file_n}.json"
+            {
+                echo "  - name: ${file_n}_${DOMAIN}"
+                echo "    type: vless"
+                echo "    server: ${DOMAIN}"
+                echo "    port: ${PUBLIC_PORT}"
+                echo "    uuid: ${id}"
+                echo "    network: ws"
+                echo "    tls: true"
+                echo "    servername: ${DOMAIN}"
+                echo "    ws-opts:"
+                echo "      path: ${WS_PATH}"
+                echo "      headers:"
+                echo "        Host: ${DOMAIN}"
+            } >> "$clash"
+        else
+            jq -n \
+                --arg domain "$DOMAIN" --argjson port "$PUBLIC_PORT" --arg id "$id" --arg path "$WS_PATH" \
+                '{
+                  log:{loglevel:"warning"},
+                  inbounds:[{port:1080,listen:"127.0.0.1",protocol:"socks",settings:{auth:"noauth",udp:true}}],
+                  outbounds:[{
+                    protocol:"vmess",
+                    settings:{vnext:[{address:$domain,port:$port,users:[{id:$id,alterId:0,security:"auto"}]}]},
+                    streamSettings:{network:"ws",security:"tls",tlsSettings:{serverName:$domain},wsSettings:{path:$path,headers:{Host:$domain}}}
+                  }]
+                }' > "${dir}/v2ray-${file_n}.json"
+            jq -n \
+                --arg domain "$DOMAIN" --argjson port "$PUBLIC_PORT" --arg id "$id" --arg path "$WS_PATH" \
+                '{
+                  inbounds:[{type:"socks",listen:"127.0.0.1",listen_port:1080}],
+                  outbounds:[{
+                    type:"vmess",server:$domain,server_port:$port,uuid:$id,security:"auto",alter_id:0,
+                    tls:{enabled:true,server_name:$domain},
+                    transport:{type:"ws",path:$path,headers:{Host:$domain}}
+                  }]
+                }' > "${dir}/sing-box-${file_n}.json"
+            {
+                echo "  - name: ${file_n}_${DOMAIN}"
+                echo "    type: vmess"
+                echo "    server: ${DOMAIN}"
+                echo "    port: ${PUBLIC_PORT}"
+                echo "    uuid: ${id}"
+                echo "    alterId: 0"
+                echo "    cipher: auto"
+                echo "    network: ws"
+                echo "    tls: true"
+                echo "    servername: ${DOMAIN}"
+                echo "    ws-opts:"
+                echo "      path: ${WS_PATH}"
+                echo "      headers:"
+                echo "        Host: ${DOMAIN}"
+            } >> "$clash"
+        fi
+    done < <(jq -r '.inbounds[0].settings.clients[] | "\(.email // "user")\t\(.id)"' "$V2RAY_CONFIG")
+    chmod -R go-rwx "$dir" 2>/dev/null || true
+    info "客户端配置已导出到：${GREEN}${dir}${PLAIN}"
+}
+
 # ---------- 启动 ----------
 start_services() {
     info "校验并启动服务 ..."
@@ -963,11 +1108,11 @@ verify_https() {
         fi
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl_code=$(curl -k -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${DOMAIN}/" 2>/dev/null || true)
+        curl_code=$(curl -k -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${DOMAIN}:${PUBLIC_PORT}/" 2>/dev/null || true)
         if [[ "$curl_code" =~ ^(200|301|302|403)$ ]]; then
-            info "HTTPS 检查通过：https://${DOMAIN}/ 返回 ${curl_code}。"
+            info "HTTPS 检查通过：https://${DOMAIN}:${PUBLIC_PORT}/ 返回 ${curl_code}。"
         else
-            warn "HTTPS 检查未通过（HTTP ${curl_code:-无响应}）。请确认云安全组/防火墙已放行 443。"
+            warn "HTTPS 检查未通过（HTTP ${curl_code:-无响应}）。请确认云安全组/防火墙已放行 ${PUBLIC_PORT}。"
         fi
     fi
 }
@@ -986,6 +1131,7 @@ do_install() {
     begin_transaction
     install_deps
     input_and_verify_domain
+    input_public_port
     check_required_ports
     choose_protocol
     install_v2ray
@@ -1006,7 +1152,7 @@ do_install() {
     echo -e " 伪装网站  : https://${DOMAIN}/"
     echo -e " 协议      : ${PROTOCOL^^} + WebSocket + TLS"
     echo -e " 地址(add) : ${DOMAIN}"
-    echo -e " 端口(port): 443"
+    echo -e " 端口(port): ${PUBLIC_PORT}"
     echo -e " UUID(id)  : ${UUID}"
     echo -e " 路径(path): ${WS_PATH}"
     echo -e "${GREEN}===============================================${PLAIN}"
@@ -1014,6 +1160,7 @@ do_install() {
     init_info_file
     print_user_link "$UUID" "admin"
     notify_info_saved
+    export_client_configs
 }
 
 # 添加用户：adduser [备注]
@@ -1042,6 +1189,7 @@ do_adduser() {
     init_info_file
     print_user_link "$uuid" "$name"
     notify_info_saved
+    export_client_configs
 }
 
 # 删除用户
@@ -1077,12 +1225,115 @@ list_and_save_users() {
         print_user_link "$id" "$n"
     done < <(jq -r '.inbounds[0].settings.clients[] | "\(.email // "user")\t\(.id)"' "$V2RAY_CONFIG")
     notify_info_saved
+    export_client_configs
 }
 
 # 查看所有用户及链接
 do_users() { check_root; require_installed; list_and_save_users; }
 
+do_export() { check_root; require_installed; export_client_configs; }
+
 do_bbr() { check_root; check_os; enable_bbr; }
+
+do_status() {
+    check_root; require_installed
+    echo "域名       : ${DOMAIN}"
+    echo "协议       : ${PROTOCOL}"
+    echo "公网端口   : ${PUBLIC_PORT}"
+    echo "本地端口   : ${V2RAY_PORT}"
+    echo "WS 路径    : ${WS_PATH}"
+    echo "伪装站目录 : ${WEBROOT}"
+    echo
+    echo "服务状态："
+    systemctl is-active nginx 2>/dev/null | awk '{print "  nginx : "$0}' || echo "  nginx : unknown"
+    systemctl is-active v2ray 2>/dev/null | awk '{print "  v2ray : "$0}' || echo "  v2ray : unknown"
+    echo
+    echo "监听端口："
+    ss -tlnp 2>/dev/null | awk -v p1=":${PUBLIC_PORT}" -v p2=":${V2RAY_PORT}" '$4 ~ p1"$" || $4 ~ p2"$" {print "  "$0}' || true
+    echo
+    verify_listening
+    verify_https
+}
+
+do_logs() {
+    check_root
+    local target="${1:-v2ray}"
+    case "$target" in
+        v2ray)
+            journalctl -u v2ray -n 120 --no-pager
+            ;;
+        nginx)
+            journalctl -u nginx -n 120 --no-pager 2>/dev/null || tail -n 120 /var/log/nginx/error.log
+            ;;
+        access)
+            tail -n 120 /var/log/v2ray/access.log
+            ;;
+        error)
+            tail -n 120 /var/log/v2ray/error.log
+            ;;
+        deploy)
+            ls -1t "${LOG_DIR}"/install-*.log 2>/dev/null | head -1 | xargs -r tail -n 160
+            ;;
+        *)
+            error "未知日志类型：${target}，可用：v2ray/nginx/access/error/deploy"
+            exit 1
+            ;;
+    esac
+}
+
+normalize_ws_path() {
+    local p="$1"
+    p=$(echo "$p" | tr -d '[:space:]')
+    [[ -z "$p" ]] && return 1
+    [[ "$p" == /* ]] || p="/$p"
+    p="${p%/}"
+    [[ "$p" =~ ^/[A-Za-z0-9._~-]+$ ]] || return 1
+    echo "$p"
+}
+
+do_path() {
+    check_root; require_installed; need_jq
+    local p="${1:-}" tmp
+    if [[ -z "$p" ]]; then
+        ask "请输入新的 WebSocket 路径（例如 /ray）："
+        read -r p
+    fi
+    p=$(normalize_ws_path "$p") || { error "路径无效，仅支持 / 后接字母、数字、点、下划线、短横线、波浪线。"; exit 1; }
+    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)" 2>/dev/null || true
+    tmp=$(mktemp)
+    jq --arg path "$p" '.inbounds[0].streamSettings.wsSettings.path = $path' "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    chmod 644 "$V2RAY_CONFIG"
+    WS_PATH="$p"
+    write_nginx_config
+    nginx -t >/dev/null
+    save_meta
+    restart_v2ray
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx
+    init_info_file
+    list_and_save_users
+    info "WebSocket 路径已更新为：${WS_PATH}"
+}
+
+do_port() {
+    check_root; require_installed
+    local p="${1:-}"
+    if [[ -z "$p" ]]; then
+        ask "请输入新的公网连接端口："
+        read -r p
+    fi
+    valid_public_port "$p" || { error "端口无效：${p}（公网 TLS 端口不能使用 80）"; exit 1; }
+    PUBLIC_PORT="$p"
+    check_required_ports
+    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)" 2>/dev/null || true
+    write_nginx_config
+    nginx -t >/dev/null
+    save_meta
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx
+    init_info_file
+    list_and_save_users
+    verify_https
+    info "公网连接端口已更新为：${PUBLIC_PORT}"
+}
 
 # ---------- 升级（网络优化 + 动态伪装），兼容非本脚本部署 ----------
 # 从 nginx 配置探测伪装站根目录（兼容 apt 版与源码编译版 nginx）
@@ -1258,7 +1509,11 @@ menu() {
     echo " 4) 查看所有用户及链接"
     echo " 5) 开启 BBR 加速"
     echo " 6) 升级配置（核心/nginx/伪装站/证书/元数据，不含BBR）"
-    echo " 7) 卸载"
+    echo " 7) 查看状态"
+    echo " 8) 导出客户端配置"
+    echo " 9) 修改 WebSocket 路径"
+    echo "10) 修改公网端口"
+    echo "11) 卸载"
     echo " 0) 退出"
     echo -e "${GREEN}=====================================${PLAIN}"
     ask "请选择操作 [0-7]："; read -r opt
@@ -1269,7 +1524,11 @@ menu() {
         4) do_users ;;
         5) do_bbr ;;
         6) do_upgrade ;;
-        7) do_uninstall ;;
+        7) do_status ;;
+        8) do_export ;;
+        9) do_path ;;
+        10) do_port ;;
+        11) do_uninstall ;;
         0) exit 0 ;;
         *) error "无效选项。"; exit 1 ;;
     esac
@@ -1283,12 +1542,17 @@ main() {
         adduser)        shift || true; do_adduser "${1:-}" ;;
         deluser)        do_deluser ;;
         users|list)     do_users ;;
+        export|clients)  do_export ;;
+        status)          do_status ;;
+        logs)            shift || true; do_logs "${1:-v2ray}" ;;
+        path)            shift || true; do_path "${1:-}" ;;
+        port)            shift || true; do_port "${1:-}" ;;
         bbr)            do_bbr ;;
         upgrade)        do_upgrade ;;
         uninstall)      do_uninstall ;;
         menu|"")        menu ;;
-        -h|--help|help) sed -n '2,21p' "$0" ;;
-        *) error "未知命令：$cmd"; sed -n '10,21p' "$0"; exit 1 ;;
+        -h|--help|help) sed -n '2,26p' "$0" ;;
+        *) error "未知命令：$cmd"; sed -n '10,26p' "$0"; exit 1 ;;
     esac
 }
 
