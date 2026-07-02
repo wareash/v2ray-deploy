@@ -22,7 +22,8 @@
 
 ```bash
 sudo bash deploy.sh             # 交互菜单
-sudo bash deploy.sh install     # 部署
+sudo bash deploy.sh install     # 部署；已部署时幂等刷新，不覆盖节点身份
+sudo bash deploy.sh reinstall   # 强制重新部署，覆盖现有节点配置并生成新 UUID/路径
 sudo bash deploy.sh adduser     # 添加用户（也可 adduser alice 直接指定备注）
 sudo bash deploy.sh deluser     # 删除用户（按序号）
 sudo bash deploy.sh users       # 查看所有用户及各自连接链接/二维码
@@ -37,6 +38,12 @@ sudo bash deploy.sh uninstall   # 卸载
 ```
 
 > 管理类命令（`users`/`adduser`/`deluser`）会自动识别现有部署的协议（**VMess / VLESS**）并从 `nginx -T` 探测域名，因此也能管理非本脚本/手动部署的节点。
+
+### 重入与幂等
+
+- 重复执行 `install` 会检测现有部署；若已部署成功，只会刷新证书续期脚本、systemd timer、元数据、健康检查和客户端导出文件，不会覆盖 UUID、协议、WebSocket 路径或端口。
+- 需要重新生成节点身份或覆盖配置时，使用 `reinstall`。该命令会二次确认，并在覆盖前备份 nginx / V2Ray / 元数据 / sysctl 配置。
+- `adduser`、`deluser`、`path`、`port` 会先生成临时配置并通过 V2Ray/nginx 校验后再替换正式配置。
 
 ### `upgrade` 升级配置说明
 

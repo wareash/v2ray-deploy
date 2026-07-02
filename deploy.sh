@@ -9,6 +9,7 @@
 # 用法：
 #   sudo bash deploy.sh                # 进入交互菜单
 #   sudo bash deploy.sh install        # 直接部署
+#   sudo bash deploy.sh reinstall      # 强制重新部署（覆盖现有节点配置）
 #   sudo bash deploy.sh adduser [备注] # 添加用户
 #   sudo bash deploy.sh deluser        # 删除用户
 #   sudo bash deploy.sh users          # 查看所有用户及链接
@@ -130,7 +131,8 @@ rollback_on_error() {
 # ---------- 元数据 持久化 / 读取 ----------
 save_meta() {
     mkdir -p "$META_DIR"
-    cat > "$META_FILE" <<EOF
+    local tmp; tmp=$(mktemp)
+    cat > "$tmp" <<EOF
 DOMAIN="${DOMAIN}"
 WS_PATH="${WS_PATH}"
 PUBLIC_PORT="${PUBLIC_PORT}"
@@ -138,6 +140,8 @@ V2RAY_PORT="${V2RAY_PORT}"
 WEBROOT="${WEBROOT}"
 PROTOCOL="${PROTOCOL}"
 EOF
+    install -m 600 "$tmp" "$META_FILE"
+    rm -f "$tmp"
 }
 
 # 从 nginx 配置探测对外服务域名（排除占位/本地名）
@@ -197,6 +201,10 @@ load_meta() {
     if [[ -f "$META_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$META_FILE"
+        PUBLIC_PORT=${PUBLIC_PORT:-443}
+        V2RAY_PORT=${V2RAY_PORT:-36649}
+        WEBROOT=${WEBROOT:-/home/wwwroot/blog}
+        PROTOCOL=${PROTOCOL:-vmess}
         return 0
     fi
     [[ -f "$V2RAY_CONFIG" ]] || return 1
@@ -225,6 +233,12 @@ require_installed() {
         exit 1
     fi
     load_meta || { error "无法读取部署信息（缺少 ${META_FILE} 且无法从现有配置推断）。"; exit 1; }
+}
+installed_deployment_exists() {
+    detect_v2ray_config_path
+    [[ -f "$V2RAY_CONFIG" ]] || return 1
+    load_meta >/dev/null 2>&1 || return 1
+    [[ -n "${DOMAIN:-}" && -n "${WS_PATH:-}" && -n "${PROTOCOL:-}" ]]
 }
 
 # ---------- 依赖 ----------
@@ -467,15 +481,20 @@ deploy_camouflage() {
     info "部署伪装站点到 ${WEBROOT} ..."
     mkdir -p "$WEBROOT"
     local tmp="/tmp/clean-blog-$$"
-    if git clone --depth 1 https://github.com/StartBootstrap/startbootstrap-clean-blog.git "$tmp" >/dev/null 2>&1 && [[ -d "$tmp/dist" ]]; then
-        cp -r "$tmp/dist/." "$WEBROOT/"
-        curl -fsSL --max-time 20 -o "$WEBROOT/js/bootstrap.bundle.min.js" \
-            https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js 2>/dev/null || true
-        [[ -s "$WEBROOT/js/bootstrap.bundle.min.js" ]] && \
-            sed -i 's#https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js#js/bootstrap.bundle.min.js#g' "$WEBROOT"/*.html
-        rm -rf "$tmp"; info "伪装主题部署完成。"
+    if [[ -e "$WEBROOT/index.html" || -e "$WEBROOT/css" ]]; then
+        info "检测到现有伪装站内容，跳过主题覆盖。"
     else
-        warn "拉取主题模板失败，将仅依赖抓取内容（页面可能无样式）。"
+        if git clone --depth 1 https://github.com/StartBootstrap/startbootstrap-clean-blog.git "$tmp" >/dev/null 2>&1 && [[ -d "$tmp/dist" ]]; then
+            cp -r "$tmp/dist/." "$WEBROOT/"
+            curl -fsSL --max-time 20 -o "$WEBROOT/js/bootstrap.bundle.min.js" \
+                https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js 2>/dev/null || true
+            [[ -s "$WEBROOT/js/bootstrap.bundle.min.js" ]] && \
+                sed -i 's#https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js#js/bootstrap.bundle.min.js#g' "$WEBROOT"/*.html
+            info "伪装主题部署完成。"
+        else
+            warn "拉取主题模板失败，将仅依赖抓取内容（页面可能无样式）。"
+        fi
+        rm -rf "$tmp"
     fi
     ensure_fallback_camouflage
     install_camouflage_updater
@@ -672,6 +691,7 @@ EOF
 write_v2ray_config() {
     info "写入 V2Ray 配置 ${V2RAY_CONFIG} ..."
     mkdir -p "$(dirname "$V2RAY_CONFIG")" /var/log/v2ray
+    local cfg_tmp; cfg_tmp=$(mktemp)
     local inbound_tag="${PROTOCOL}-in"
     local settings
     if [[ "${PROTOCOL,,}" == "vless" ]]; then
@@ -685,7 +705,7 @@ EOF
 EOF
 )
     fi
-    cat > "$V2RAY_CONFIG" <<EOF
+    cat > "$cfg_tmp" <<EOF
 {
   "log": { "access": "/var/log/v2ray/access.log", "error": "/var/log/v2ray/error.log", "loglevel": "warning" },
   "inbounds": [
@@ -706,7 +726,9 @@ EOF
 }
 EOF
     # 官方 v2ray 服务以 User=nobody 运行，必须保证配置文件对其可读
-    chmod 644 "$V2RAY_CONFIG"
+    /usr/local/bin/v2ray test -c "$cfg_tmp" >/dev/null
+    install -m 644 "$cfg_tmp" "$V2RAY_CONFIG"
+    rm -f "$cfg_tmp"
 }
 
 # ---------- 写 Nginx 配置 ----------
@@ -714,7 +736,8 @@ write_nginx_config() {
     info "写入 Nginx 配置 ${NGINX_CONF} ..."
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     mkdir -p "$(dirname "$NGINX_CONF")"
-    cat > "$NGINX_CONF" <<EOF
+    local conf_tmp; conf_tmp=$(mktemp)
+    cat > "$conf_tmp" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -759,6 +782,8 @@ server {
     }
 }
 EOF
+    install -m 644 "$conf_tmp" "$NGINX_CONF"
+    rm -f "$conf_tmp"
 }
 
 # ---------- 证书续期 ----------
@@ -1126,8 +1151,25 @@ restart_v2ray() {
 # ====================== 子命令 ======================
 
 do_install() {
+    local mode="${1:-}"
     check_root; check_os; check_systemd; setup_logging
     detect_v2ray_config_path
+    if [[ "$mode" != "force" ]] && installed_deployment_exists; then
+        info "检测到现有部署，install 将保持幂等，不覆盖当前节点配置。"
+        info "如需重新生成 UUID/路径/协议并覆盖配置，请执行：sudo bash deploy.sh reinstall"
+        setup_renew
+        install_camouflage_updater
+        setup_camouflage_timer
+        save_meta
+        start_services
+        list_and_save_users
+        return 0
+    fi
+    if [[ "$mode" == "force" ]]; then
+        warn "强制重新部署会覆盖现有 V2Ray/Nginx 节点配置，并生成新的 UUID 与路径。"
+        ask "确认继续？(y/N)："; read -r force_confirm
+        [[ "${force_confirm,,}" == "y" ]] || { info "已取消。"; return 0; }
+    fi
     begin_transaction
     install_deps
     input_and_verify_domain
@@ -1177,12 +1219,14 @@ do_adduser() {
     if [[ "${PROTOCOL,,}" == "vless" ]]; then
         jq --arg id "$uuid" --arg n "$name" \
             '.inbounds[0].settings.clients += [{"id":$id,"email":$n}]' \
-            "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+            "$V2RAY_CONFIG" > "$tmp"
     else
         jq --arg id "$uuid" --arg n "$name" \
             '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$n}]' \
-            "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+            "$V2RAY_CONFIG" > "$tmp"
     fi
+    /usr/local/bin/v2ray test -c "$tmp" >/dev/null
+    mv "$tmp" "$V2RAY_CONFIG"
     chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已添加用户：${name}"
@@ -1206,7 +1250,9 @@ do_deluser() {
     local jq_idx=$((idx-1))
     local name; name=$(echo "${users[$jq_idx]}" | cut -f1)
     local tmp; tmp=$(mktemp)
-    jq "del(.inbounds[0].settings.clients[$jq_idx])" "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    jq "del(.inbounds[0].settings.clients[$jq_idx])" "$V2RAY_CONFIG" > "$tmp"
+    /usr/local/bin/v2ray test -c "$tmp" >/dev/null
+    mv "$tmp" "$V2RAY_CONFIG"
     chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已删除用户：${name}"
@@ -1301,7 +1347,9 @@ do_path() {
     p=$(normalize_ws_path "$p") || { error "路径无效，仅支持 / 后接字母、数字、点、下划线、短横线、波浪线。"; exit 1; }
     cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)" 2>/dev/null || true
     tmp=$(mktemp)
-    jq --arg path "$p" '.inbounds[0].streamSettings.wsSettings.path = $path' "$V2RAY_CONFIG" > "$tmp" && mv "$tmp" "$V2RAY_CONFIG"
+    jq --arg path "$p" '.inbounds[0].streamSettings.wsSettings.path = $path' "$V2RAY_CONFIG" > "$tmp"
+    /usr/local/bin/v2ray test -c "$tmp" >/dev/null
+    mv "$tmp" "$V2RAY_CONFIG"
     chmod 644 "$V2RAY_CONFIG"
     WS_PATH="$p"
     write_nginx_config
@@ -1504,31 +1552,33 @@ menu() {
     check_root
     echo -e "${GREEN}========= V2Ray 部署管理脚本 =========${PLAIN}"
     echo " 1) 安装 / 部署"
-    echo " 2) 添加用户"
-    echo " 3) 删除用户"
-    echo " 4) 查看所有用户及链接"
-    echo " 5) 开启 BBR 加速"
-    echo " 6) 升级配置（核心/nginx/伪装站/证书/元数据，不含BBR）"
-    echo " 7) 查看状态"
-    echo " 8) 导出客户端配置"
-    echo " 9) 修改 WebSocket 路径"
-    echo "10) 修改公网端口"
-    echo "11) 卸载"
+    echo " 2) 强制重新部署"
+    echo " 3) 添加用户"
+    echo " 4) 删除用户"
+    echo " 5) 查看所有用户及链接"
+    echo " 6) 开启 BBR 加速"
+    echo " 7) 升级配置（核心/nginx/伪装站/证书/元数据，不含BBR）"
+    echo " 8) 查看状态"
+    echo " 9) 导出客户端配置"
+    echo "10) 修改 WebSocket 路径"
+    echo "11) 修改公网端口"
+    echo "12) 卸载"
     echo " 0) 退出"
     echo -e "${GREEN}=====================================${PLAIN}"
-    ask "请选择操作 [0-7]："; read -r opt
+    ask "请选择操作 [0-12]："; read -r opt
     case "$opt" in
         1) do_install ;;
-        2) do_adduser ;;
-        3) do_deluser ;;
-        4) do_users ;;
-        5) do_bbr ;;
-        6) do_upgrade ;;
-        7) do_status ;;
-        8) do_export ;;
-        9) do_path ;;
-        10) do_port ;;
-        11) do_uninstall ;;
+        2) do_install force ;;
+        3) do_adduser ;;
+        4) do_deluser ;;
+        5) do_users ;;
+        6) do_bbr ;;
+        7) do_upgrade ;;
+        8) do_status ;;
+        9) do_export ;;
+        10) do_path ;;
+        11) do_port ;;
+        12) do_uninstall ;;
         0) exit 0 ;;
         *) error "无效选项。"; exit 1 ;;
     esac
@@ -1539,6 +1589,7 @@ main() {
     local cmd="${1:-menu}"
     case "$cmd" in
         install)        do_install ;;
+        reinstall|force-install) do_install force ;;
         adduser)        shift || true; do_adduser "${1:-}" ;;
         deluser)        do_deluser ;;
         users|list)     do_users ;;
