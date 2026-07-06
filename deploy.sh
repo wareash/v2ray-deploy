@@ -485,6 +485,33 @@ choose_protocol() {
 }
 
 # ---------- 证书 ----------
+diagnose_acme_failure() {
+    local rc="$1" recent="" public_ip="" domain_ip="" domain_ipv6=""
+    warn "证书签发失败（acme.sh 退出码 ${rc}）。"
+    if [[ -s "$ACME_LOG" ]]; then
+        recent=$(grep -Ei "Invalid status|Verification error|Error getting validation data|Timeout|Connection refused|No route|DNS problem|CAA|rateLimited|too many certificates|unauthorized|NXDOMAIN|SERVFAIL" "$ACME_LOG" | tail -5 || true)
+        if [[ -n "$recent" ]]; then
+            warn "acme.sh 关键错误："
+            sed "s/^/  /" <<<"$recent"
+        fi
+    fi
+    if [[ -s "$ACME_LOG" ]] && grep -Eqi "Invalid status|Verification error|Error getting validation data|Timeout|Connection refused|No route" "$ACME_LOG"; then
+        warn "HTTP-01 校验失败：证书机构必须能从公网访问 http://${DOMAIN}/.well-known/acme-challenge/..."
+        warn "请检查：本机防火墙 TCP 80、云安全组/安全列表 TCP 80、域名 A 记录是否指向本机。"
+        public_ip=$(get_public_ip 2>/dev/null || true)
+        domain_ip=$(resolve_domain "$DOMAIN" 2>/dev/null || true)
+        domain_ipv6=$(resolve_domain_v6 "$DOMAIN" 2>/dev/null || true)
+        [[ -n "$public_ip" ]] && warn "本机公网 IPv4：${public_ip}"
+        [[ -n "$domain_ip" ]] && warn "域名 A 记录：${domain_ip}"
+        [[ -n "$domain_ipv6" ]] && warn "域名 AAAA 记录：${domain_ipv6}（若服务器没有可用公网 IPv6，建议删除 AAAA 或确认 IPv6 入站可达）"
+    elif [[ -s "$ACME_LOG" ]] && grep -Eqi "rateLimited|too many certificates" "$ACME_LOG"; then
+        warn "证书机构触发频率限制，请稍后重试或更换域名/证书账号。"
+    else
+        warn "请确认 80 端口空闲、域名已解析、防火墙/云安全组已放行 80/${PUBLIC_PORT}。"
+    fi
+    warn "证书日志：${ACME_LOG}"
+}
+
 issue_cert() {
     mkdir -p "$CERT_DIR"
     [[ -n "$ACME_LOG" ]] || ACME_LOG="${LOG_DIR}/acme-$(date '+%Y%m%d-%H%M%S').log"
@@ -499,9 +526,9 @@ issue_cert() {
     local rc=0
     "${ACME_HOME}/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 >>"$ACME_LOG" 2>&1 || rc=$?
     if [[ $rc -ne 0 && $rc -ne 2 ]]; then
-        error "证书签发失败（acme.sh 退出码 ${rc}）。请确认 80 端口空闲、域名已解析、防火墙放行 80/${PUBLIC_PORT}。"
-        warn "证书日志：${ACME_LOG}"
-        systemctl start nginx >/dev/null 2>&1 || true; exit 1
+        diagnose_acme_failure "$rc"
+        systemctl start nginx >/dev/null 2>&1 || true
+        exit 1
     fi
     # 安装/复制证书到目标路径
     "${ACME_HOME}/acme.sh" --install-cert -d "$DOMAIN" --ecc \
