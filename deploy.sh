@@ -334,6 +334,48 @@ check_required_ports() {
     done
 }
 
+iptables_port_allowed() {
+    local p="$1"
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -C INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1
+}
+iptables_input_has_terminal_block() {
+    command -v iptables >/dev/null 2>&1 || return 1
+    iptables -S INPUT 2>/dev/null | grep -Eq "^-A INPUT .* -j (REJECT|DROP)( |$)"
+}
+open_iptables_port() {
+    local p="$1"
+    iptables_port_allowed "$p" && return 0
+    iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+    info "已放行本机防火墙 TCP ${p}。"
+}
+persist_iptables_rules() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || warn "netfilter-persistent 保存规则失败；当前规则已生效但可能不会重启后保留。"
+    elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4 || warn "保存 /etc/iptables/rules.v4 失败；当前规则已生效但可能不会重启后保留。"
+    else
+        warn "未检测到 netfilter-persistent 或 /etc/iptables/rules.v4，防火墙规则可能不会重启后保留。"
+    fi
+}
+ensure_local_firewall_ports() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables_input_has_terminal_block || return 0
+    local p missing=()
+    for p in 80 "$PUBLIC_PORT"; do
+        iptables_port_allowed "$p" || missing+=("$p")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+    warn "检测到本机 iptables 可能阻止 TCP ${missing[*]}，这会导致证书签发或客户端连接失败。"
+    ask "是否自动放行这些端口并尝试持久化？(Y/n)："
+    local c; read -r c
+    [[ -z "$c" || "${c,,}" == "y" ]] || { warn "已跳过本机防火墙修复，请确认云安全组和本机防火墙已放行 80/${PUBLIC_PORT}。"; return 0; }
+    for p in "${missing[@]}"; do
+        open_iptables_port "$p"
+    done
+    persist_iptables_rules
+}
+
 # ---------- 交互：域名输入与校验 ----------
 input_and_verify_domain() {
     local server_ip server_ipv6
@@ -1165,6 +1207,11 @@ do_install() {
         list_and_save_users
         return 0
     fi
+    if [[ "$mode" != "force" && -f "$V2RAY_CONFIG" ]]; then
+        warn "检测到不完整或旧版 V2Ray 配置（无法读取 ${META_FILE} 或从现有配置推断）。"
+        warn "本次 install 将按全新部署覆盖节点配置；旧配置会先备份到部署日志目录。"
+    fi
+
     if [[ "$mode" == "force" ]]; then
         warn "强制重新部署会覆盖现有 V2Ray/Nginx 节点配置，并生成新的 UUID 与路径。"
         ask "确认继续？(y/N)："; read -r force_confirm
@@ -1175,6 +1222,7 @@ do_install() {
     input_and_verify_domain
     input_public_port
     check_required_ports
+    ensure_local_firewall_ports
     choose_protocol
     install_v2ray
     detect_v2ray_config_path
