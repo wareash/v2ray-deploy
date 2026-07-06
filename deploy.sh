@@ -691,7 +691,7 @@ EOF
 write_v2ray_config() {
     info "写入 V2Ray 配置 ${V2RAY_CONFIG} ..."
     mkdir -p "$(dirname "$V2RAY_CONFIG")" /var/log/v2ray
-    local cfg_tmp; cfg_tmp=$(mktemp)
+    local cfg_tmp; cfg_tmp=$(mktemp --suffix=.json)
     local inbound_tag="${PROTOCOL}-in"
     local settings
     if [[ "${PROTOCOL,,}" == "vless" ]]; then
@@ -1215,7 +1215,7 @@ do_adduser() {
         error "用户备注 '${name}' 已存在，请换一个。"; exit 1
     fi
     local uuid; uuid=$(gen_uuid)
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp --suffix=.json)
     if [[ "${PROTOCOL,,}" == "vless" ]]; then
         jq --arg id "$uuid" --arg n "$name" \
             '.inbounds[0].settings.clients += [{"id":$id,"email":$n}]' \
@@ -1249,7 +1249,7 @@ do_deluser() {
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > total )); then error "序号无效。"; exit 1; fi
     local jq_idx=$((idx-1))
     local name; name=$(echo "${users[$jq_idx]}" | cut -f1)
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp --suffix=.json)
     jq "del(.inbounds[0].settings.clients[$jq_idx])" "$V2RAY_CONFIG" > "$tmp"
     /usr/local/bin/v2ray test -c "$tmp" >/dev/null
     mv "$tmp" "$V2RAY_CONFIG"
@@ -1346,7 +1346,7 @@ do_path() {
     fi
     p=$(normalize_ws_path "$p") || { error "路径无效，仅支持 / 后接字母、数字、点、下划线、短横线、波浪线。"; exit 1; }
     cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)" 2>/dev/null || true
-    tmp=$(mktemp)
+    tmp=$(mktemp --suffix=.json)
     jq --arg path "$p" '.inbounds[0].streamSettings.wsSettings.path = $path' "$V2RAY_CONFIG" > "$tmp"
     /usr/local/bin/v2ray test -c "$tmp" >/dev/null
     mv "$tmp" "$V2RAY_CONFIG"
