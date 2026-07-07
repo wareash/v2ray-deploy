@@ -14,6 +14,7 @@
 #   sudo bash deploy.sh deluser        # 删除用户
 #   sudo bash deploy.sh users          # 查看所有用户及链接
 #   sudo bash deploy.sh export         # 导出 v2ray/sing-box/Clash 客户端配置
+#   sudo bash deploy.sh subscription   # 生成/刷新 Clash/Mihomo 订阅 URL
 #   sudo bash deploy.sh status         # 查看服务状态与健康检查
 #   sudo bash deploy.sh logs [类型]    # 查看日志：v2ray/nginx/access/error/deploy
 #   sudo bash deploy.sh path [路径]    # 修改 WebSocket 路径
@@ -47,6 +48,7 @@ UUID=""
 PROTOCOL="vless"   # 新部署默认 vless；管理旧/手动部署时会从配置自动探测
 RUN_DIR="$(pwd)"   # 脚本被调用时的工作目录；运行结束把连接信息保存到这里
 INFO_FILE=""       # 运行目录下保存连接信息的文件（init_info_file 时确定）
+SUB_PATH=""        # Clash/Mihomo 订阅相对路径（upgrade 首次生成后持久化）
 CERT_DIR="/data"
 CERT_FILE="${CERT_DIR}/v2ray.crt"
 KEY_FILE="${CERT_DIR}/v2ray.key"
@@ -139,6 +141,7 @@ PUBLIC_PORT="${PUBLIC_PORT}"
 V2RAY_PORT="${V2RAY_PORT}"
 WEBROOT="${WEBROOT}"
 PROTOCOL="${PROTOCOL}"
+SUB_PATH="${SUB_PATH}"
 EOF
     install -m 600 "$tmp" "$META_FILE"
     rm -f "$tmp"
@@ -205,6 +208,7 @@ load_meta() {
         V2RAY_PORT=${V2RAY_PORT:-36649}
         WEBROOT=${WEBROOT:-/home/wwwroot/blog}
         PROTOCOL=${PROTOCOL:-vmess}
+        SUB_PATH=${SUB_PATH:-}
         return 0
     fi
     [[ -f "$V2RAY_CONFIG" ]] || return 1
@@ -1160,6 +1164,129 @@ export_client_configs() {
     info "客户端配置已导出到：${GREEN}${dir}${PLAIN}"
 }
 
+ensure_subscription_path() {
+    if [[ -z "${SUB_PATH:-}" ]]; then
+        SUB_PATH="/assets/sub/v2ray-$(head /dev/urandom | tr -dc 'a-f0-9' | head -c16).yaml"
+    fi
+}
+
+subscription_url() {
+    if [[ "${PUBLIC_PORT}" == "443" ]]; then
+        echo "https://${DOMAIN}${SUB_PATH}"
+    else
+        echo "https://${DOMAIN}:${PUBLIC_PORT}${SUB_PATH}"
+    fi
+}
+
+publish_subscription() {
+    [[ -n "$DOMAIN" && -n "$WS_PATH" ]] || return 0
+    need_jq
+    ensure_subscription_path
+    local sub_file="${WEBROOT}${SUB_PATH}"
+    local sub_dir node_names=""
+    sub_dir=$(dirname "$sub_file")
+    mkdir -p "$sub_dir"
+    {
+        cat <<'EOF'
+port: 7890
+socks-port: 7891
+allow-lan: true
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+rule-providers:
+  reject: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt", path: ./ruleset/reject.yaml, interval: 86400 }
+  icloud: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt", path: ./ruleset/icloud.yaml, interval: 86400 }
+  apple: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt", path: ./ruleset/apple.yaml, interval: 86400 }
+  google: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt", path: ./ruleset/google.yaml, interval: 86400 }
+  proxy: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt", path: ./ruleset/proxy.yaml, interval: 86400 }
+  direct: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt", path: ./ruleset/direct.yaml, interval: 86400 }
+  private: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt", path: ./ruleset/private.yaml, interval: 86400 }
+  gfw: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt", path: ./ruleset/gfw.yaml, interval: 86400 }
+  tld-not-cn: { type: http, behavior: domain, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt", path: ./ruleset/tld-not-cn.yaml, interval: 86400 }
+  telegramcidr: { type: http, behavior: ipcidr, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt", path: ./ruleset/telegramcidr.yaml, interval: 86400 }
+  cncidr: { type: http, behavior: ipcidr, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt", path: ./ruleset/cncidr.yaml, interval: 86400 }
+  lancidr: { type: http, behavior: ipcidr, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt", path: ./ruleset/lancidr.yaml, interval: 86400 }
+  applications: { type: http, behavior: classical, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt", path: ./ruleset/applications.yaml, interval: 86400 }
+proxies:
+EOF
+        while IFS=$'\t' read -r name id; do
+            [[ -z "$id" ]] && continue
+            local n file_n
+            n=${name:-user}
+            file_n=$(safe_name "$n")
+            [[ -n "$file_n" ]] || file_n="user"
+            local proxy_name="${file_n}_${DOMAIN}"
+            node_names+="${proxy_name}"$'\n'
+            if [[ "${PROTOCOL,,}" == "vless" ]]; then
+                echo "  - { name: \"${proxy_name}\", type: vless, server: ${DOMAIN}, port: ${PUBLIC_PORT}, uuid: ${id}, network: ws, tls: true, udp: true, servername: \"${DOMAIN}\", client-fingerprint: \"chrome\", ws-opts: { path: \"${WS_PATH}\", headers: { Host: \"${DOMAIN}\" } } }"
+            else
+                echo "  - { name: \"${proxy_name}\", type: vmess, server: ${DOMAIN}, port: ${PUBLIC_PORT}, uuid: ${id}, alterId: 0, cipher: auto, network: ws, tls: true, udp: true, servername: \"${DOMAIN}\", ws-opts: { path: \"${WS_PATH}\", headers: { Host: \"${DOMAIN}\" } } }"
+            fi
+        done < <(jq -r '.inbounds[0].settings.clients[] | "\(.email // "user")\t\(.id)"' "$V2RAY_CONFIG")
+        cat <<'EOF'
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+EOF
+        while read -r n; do [[ -n "$n" ]] && echo "      - \"${n}\""; done <<<"$node_names"
+        cat <<'EOF'
+      - DIRECT
+  - name: ♻️ 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+EOF
+        while read -r n; do [[ -n "$n" ]] && echo "      - \"${n}\""; done <<<"$node_names"
+        cat <<'EOF'
+  - name: 🍎 Apple
+    type: select
+    proxies:
+      - DIRECT
+      - 🚀 节点选择
+  - name: 📢 Google
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - DIRECT
+  - name: 🛑 广告拦截
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+rules:
+  - RULE-SET,applications,DIRECT
+  - RULE-SET,private,DIRECT
+  - RULE-SET,reject,🛑 广告拦截
+  - RULE-SET,icloud,DIRECT
+  - RULE-SET,apple,🍎 Apple
+  - RULE-SET,google,📢 Google
+  - RULE-SET,proxy,🚀 节点选择
+  - RULE-SET,gfw,🚀 节点选择
+  - RULE-SET,tld-not-cn,🚀 节点选择
+  - RULE-SET,telegramcidr,🚀 节点选择
+  - RULE-SET,direct,DIRECT
+  - RULE-SET,lancidr,DIRECT
+  - RULE-SET,cncidr,DIRECT
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,🚀 节点选择
+EOF
+    } > "$sub_file"
+    chmod 644 "$sub_file"
+    save_meta
+    if [[ -n "${INFO_FILE:-}" && -f "$INFO_FILE" ]]; then
+        {
+            echo "订阅链接：$(subscription_url)"
+            echo "----------------------------------------"
+        } >> "$INFO_FILE" 2>/dev/null || true
+        chmod 600 "$INFO_FILE" 2>/dev/null || true
+    fi
+    info "Clash/Mihomo 订阅已生成：${GREEN}$(subscription_url)${PLAIN}"
+}
+
 # ---------- 启动 ----------
 start_services() {
     info "校验并启动服务 ..."
@@ -1278,6 +1405,7 @@ do_install() {
     print_user_link "$UUID" "admin"
     notify_info_saved
     export_client_configs
+    publish_subscription
 }
 
 # 添加用户：adduser [备注]
@@ -1309,6 +1437,7 @@ do_adduser() {
     print_user_link "$uuid" "$name"
     notify_info_saved
     export_client_configs
+    publish_subscription
 }
 
 # 删除用户
@@ -1331,6 +1460,7 @@ do_deluser() {
     chmod 644 "$V2RAY_CONFIG"  # mktemp 默认 600，需恢复为 nobody 可读
     restart_v2ray
     info "已删除用户：${name}"
+    publish_subscription
 }
 
 # 列出所有用户、打印链接并保存到运行目录信息文件（需先 require_installed）
@@ -1347,12 +1477,15 @@ list_and_save_users() {
     done < <(jq -r '.inbounds[0].settings.clients[] | "\(.email // "user")\t\(.id)"' "$V2RAY_CONFIG")
     notify_info_saved
     export_client_configs
+    publish_subscription
 }
 
 # 查看所有用户及链接
 do_users() { check_root; require_installed; list_and_save_users; }
 
 do_export() { check_root; require_installed; export_client_configs; }
+
+do_subscription() { check_root; require_installed; publish_subscription; }
 
 do_bbr() { check_root; check_os; enable_bbr; }
 
@@ -1635,12 +1768,13 @@ menu() {
     echo " 7) 升级配置（核心/nginx/伪装站/证书/元数据，不含BBR）"
     echo " 8) 查看状态"
     echo " 9) 导出客户端配置"
-    echo "10) 修改 WebSocket 路径"
-    echo "11) 修改公网端口"
-    echo "12) 卸载"
+    echo "10) 生成/刷新订阅 URL"
+    echo "11) 修改 WebSocket 路径"
+    echo "12) 修改公网端口"
+    echo "13) 卸载"
     echo " 0) 退出"
     echo -e "${GREEN}=====================================${PLAIN}"
-    ask "请选择操作 [0-12]："; read -r opt
+    ask "请选择操作 [0-13]："; read -r opt
     case "$opt" in
         1) do_install ;;
         2) do_install force ;;
@@ -1651,9 +1785,10 @@ menu() {
         7) do_upgrade ;;
         8) do_status ;;
         9) do_export ;;
-        10) do_path ;;
-        11) do_port ;;
-        12) do_uninstall ;;
+        10) do_subscription ;;
+        11) do_path ;;
+        12) do_port ;;
+        13) do_uninstall ;;
         0) exit 0 ;;
         *) error "无效选项。"; exit 1 ;;
     esac
@@ -1669,6 +1804,7 @@ main() {
         deluser)        do_deluser ;;
         users|list)     do_users ;;
         export|clients)  do_export ;;
+        subscription|sub) do_subscription ;;
         status)          do_status ;;
         logs)            shift || true; do_logs "${1:-v2ray}" ;;
         path)            shift || true; do_path "${1:-}" ;;
@@ -1677,8 +1813,8 @@ main() {
         upgrade)        do_upgrade ;;
         uninstall)      do_uninstall ;;
         menu|"")        menu ;;
-        -h|--help|help) sed -n '2,26p' "$0" ;;
-        *) error "未知命令：$cmd"; sed -n '10,26p' "$0"; exit 1 ;;
+        -h|--help|help) sed -n '2,27p' "$0" ;;
+        *) error "未知命令：$cmd"; sed -n '10,27p' "$0"; exit 1 ;;
     esac
 }
 
