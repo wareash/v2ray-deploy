@@ -2,6 +2,8 @@
 
 一键部署 **V2Ray (VLESS/VMess + WebSocket + TLS)** 并用真实静态网站进行伪装的交互式脚本。
 
+> **项目状态：持续维护。** 面向需要自主管理 Linux 节点的用户；脚本会修改 Nginx、systemd、防火墙与证书配置，建议先在全新 VPS 或可回滚环境中使用。
+
 普通访客访问域名时看到的是一个正常的技术博客，只有走随机暗道路径的 WebSocket 流量才会进入 V2Ray 代理，从而降低被识别和封锁的概率。
 
 ## 特性
@@ -84,6 +86,14 @@ anywhere://add-proxy?link=<分享链接>
 curl -fsSLO https://raw.githubusercontent.com/wareash/v2ray-deploy/main/deploy.sh
 
 # 运行（交互式）
+sudo bash deploy.sh
+```
+
+如果希望先审查脚本再执行，可下载后查看变更：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/wareash/v2ray-deploy/main/deploy.sh
+less deploy.sh
 sudo bash deploy.sh
 ```
 
